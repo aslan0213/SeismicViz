@@ -1,9 +1,38 @@
 // ---------------------------------------------------------------------------
-//  SpectrumService  -  Independent C# spectrum-analysis module
+//  SpectrumService  -  Independent C# spectrum-analysis module (WAVERITY task)
 //
 //  A standalone TCP server that receives a 2D seismic slice (or an ROI cut out
 //  of one) from the Python host application, computes the *average amplitude
 //  spectrum* over all traces, and returns it.
+//
+//  Usage:
+//      SpectrumService.exe [--port N] [--selftest]
+//
+//      --port N    Listen on 127.0.0.1:N.  N = 0 (default) -> OS picks a free
+//                  port.  The chosen port is printed to stdout as
+//                  "PORT <n>" followed by "READY", so the parent process can
+//                  parse it.
+//      --selftest  Run an internal FFT sanity check and exit.
+//
+//  Wire protocol (all little-endian, see docs/protocol.md):
+//
+//    Request                            Response (OK)
+//    -------------------------------    ---------------------------------
+//    char[4]  "SPEC"                    char[4]  "SPCR"
+//    int32    version (=1)              int32    status (0 = OK)
+//    int32    nTraces                   int32    nFreq  (= nfft/2 + 1)
+//    int32    nSamples                  float64  df     (Hz per bin)
+//    float64  dt      (seconds)         float32[nFreq] average amplitude
+//    int32    window  (0/1/2)
+//    float32[nTraces*nSamples] data     Response (error)
+//             (row-major, one trace     ---------------------------------
+//              per row, time along      char[4]  "SPCR"
+//              the row)                 int32    status (!= 0)
+//                                       int32    msgLen
+//                                       byte[msgLen] UTF-8 message
+//
+//  Written against C# 5 / .NET Framework 4.0 so that it compiles with the
+//  in-box csc.exe (no SDK or NuGet packages required).
 // ---------------------------------------------------------------------------
 
 using System;
@@ -113,7 +142,11 @@ namespace Waverity.Spectrum
 
         /// <summary>
         /// Average single-sided amplitude spectrum of a trace gather.
+        /// Each trace is de-meaned, tapered, zero padded to a power of two and
+        /// transformed; the magnitudes are then averaged across traces.
         /// </summary>
+        /// <param name="data">nTraces * nSamples, row major.</param>
+        /// <returns>nfft/2 + 1 amplitude values.</returns>
         public static float[] AverageAmplitudeSpectrum(
             float[] data, int nTraces, int nSamples, int windowKind, out int nfft)
         {
@@ -125,6 +158,7 @@ namespace Waverity.Spectrum
             double[] re = new double[nfft];
             double[] im = new double[nfft];
 
+            // Normalise so the amplitude is independent of the taper's energy.
             double taperGain = 0.0;
             for (int i = 0; i < nSamples; i++) taperGain += taper[i];
             if (taperGain <= 0.0) taperGain = nSamples;
@@ -146,7 +180,7 @@ namespace Waverity.Spectrum
                     re[i] = v;
                     im[i] = 0.0;
                 }
-                if (!finite) continue;
+                if (!finite) continue;          // skip dead / corrupt traces
 
                 for (int i = nSamples; i < nfft; i++) { re[i] = 0.0; im[i] = 0.0; }
 
@@ -155,6 +189,7 @@ namespace Waverity.Spectrum
                 for (int k = 0; k < nFreq; k++)
                 {
                     double mag = Math.Sqrt(re[k] * re[k] + im[k] * im[k]);
+                    // Single-sided scaling: interior bins carry twice the energy.
                     if (k > 0 && k < nfft / 2) mag *= 2.0;
                     accum[k] += mag / taperGain;
                 }
@@ -175,7 +210,7 @@ namespace Waverity.Spectrum
     internal static class Program
     {
         private const int ProtocolVersion = 1;
-        private const int MaxSamples      = 1 << 20;
+        private const int MaxSamples      = 1 << 20;   // guards against bad headers
         private const long MaxPayload     = 512L << 20;
 
         private static int Main(string[] args)
@@ -234,6 +269,7 @@ namespace Waverity.Spectrum
                 client.NoDelay = true;
                 using (NetworkStream stream = client.GetStream())
                 {
+                    // One connection may carry many requests back to back.
                     while (ServeOneRequest(stream)) { }
                 }
             }
@@ -247,10 +283,11 @@ namespace Waverity.Spectrum
             }
         }
 
+        /// <returns>true if the caller should keep the connection open.</returns>
         private static bool ServeOneRequest(NetworkStream stream)
         {
             byte[] magic = new byte[4];
-            if (!TryReadExactly(stream, magic, 4)) return false;
+            if (!TryReadExactly(stream, magic, 4)) return false;   // clean EOF
 
             if (Encoding.ASCII.GetString(magic) != "SPEC")
             {
@@ -301,7 +338,7 @@ namespace Waverity.Spectrum
             Buffer.BlockCopy(raw, 0, data, 0, raw.Length);
             raw = null;
 
-            if (dt <= 0.0) dt = 0.004;
+            if (dt <= 0.0) dt = 0.004;   // fall back to a 4 ms sample rate
 
             try
             {
@@ -353,7 +390,7 @@ namespace Waverity.Spectrum
                 stream.Write(all, 0, all.Length);
                 stream.Flush();
             }
-            catch { }
+            catch { /* the peer is already gone */ }
 
             Console.Error.WriteLine("ERROR " + status + ": " + message);
         }
@@ -411,6 +448,7 @@ namespace Waverity.Spectrum
 
         private static int SelfTest()
         {
+            // A 25 Hz sine sampled at 4 ms must peak in the 25 Hz bin.
             const int nSamples = 512;
             const int nTraces  = 8;
             const double dt    = 0.004;
@@ -436,7 +474,7 @@ namespace Waverity.Spectrum
             Console.WriteLine("peak amp  = " + amp[peak].ToString("F4"));
 
             bool freqOk = Math.Abs(peakHz - f0) <= df;
-            bool ampOk  = Math.Abs(amp[peak] - 1.0) < 0.15;
+            bool ampOk  = Math.Abs(amp[peak] - 1.0) < 0.15;   // sine amplitude is 1.0
 
             Console.WriteLine(freqOk ? "PASS frequency" : "FAIL frequency");
             Console.WriteLine(ampOk  ? "PASS amplitude" : "FAIL amplitude");
