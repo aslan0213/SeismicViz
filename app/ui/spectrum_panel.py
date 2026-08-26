@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -212,7 +212,7 @@ class SpectrumPanel(QWidget):
             peak_freq = float(freqs[peak_idx])
             peak_line = pg.InfiniteLine(
                 pos=peak_freq, angle=90,
-                pen=pg.mkPen(pen.color(), width=1, style=2),
+                pen=pg.mkPen(pen.color(), width=1, style=Qt.PenStyle.DashLine),
             )
             self.plot_widget.addItem(peak_line)
 
