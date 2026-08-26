@@ -37,7 +37,7 @@ PREVIEW_SHARPEN = "Image sharpening (preview of this slice)"
 def axis_map_for(volume: SeismicVolume, axis: int) -> AxisMap:
     """Axis calibration for a section taken along ``axis``."""
     geometry = volume.geometry
-    if axis == AXIS_ILINE:
+    if axis == AXIS_ILINE:                        # section is (crossline, time)
         return AxisMap(
             x0=geometry.xline_label(0),
             dx=geometry.xl_step,
@@ -46,7 +46,7 @@ def axis_map_for(volume: SeismicVolume, axis: int) -> AxisMap:
             x_label="Crossline",
             y_label="Time (ms)",
         )
-    if axis == AXIS_XLINE:
+    if axis == AXIS_XLINE:                        # section is (inline, time)
         return AxisMap(
             x0=geometry.iline_label(0),
             dx=geometry.il_step,
@@ -55,7 +55,7 @@ def axis_map_for(volume: SeismicVolume, axis: int) -> AxisMap:
             x_label="Inline",
             y_label="Time (ms)",
         )
-    return AxisMap(
+    return AxisMap(                               # time slice is (inline, crossline)
         x0=geometry.iline_label(0),
         dx=geometry.il_step,
         y0=geometry.xline_label(0),
@@ -82,7 +82,7 @@ class FilterWorker(QThread):
     def cancel(self) -> None:
         self._cancelled = True
 
-    def run(self) -> None:
+    def run(self) -> None:  # noqa: D102 - QThread entry point
         def report(percent: int) -> bool:
             self.progressed.emit(percent)
             return not self._cancelled
@@ -426,6 +426,7 @@ class MainWindow(QMainWindow):
     def _compute_comparison(
         self, left: np.ndarray, axis: int, index: int
     ) -> tuple[np.ndarray | None, str]:
+        """The right-hand section for the current comparison source."""
         source = self.compare_view.source
 
         if source == PREVIEW_SMOOTH:
@@ -456,6 +457,7 @@ class MainWindow(QMainWindow):
         return None, ""
 
     def _mirror_settings(self) -> None:
+        """Keep the comparison panel on the reference panel's scale."""
         if self.compare_view.show_difference:
             return
         self.settings_b.copy_from(self.settings)
@@ -630,6 +632,7 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+
         try:
             if widget is self.view3d and self.view3d.available:
                 self.view3d.screenshot(path)
@@ -672,12 +675,12 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- drag & drop
 
-    def dragEnterEvent(self, event) -> None:
+    def dragEnterEvent(self, event) -> None:  # noqa: N802 - Qt naming
         if event.mimeData().hasUrls():
             if any(url.toLocalFile().lower().endswith(".npy") for url in event.mimeData().urls()):
                 event.acceptProposedAction()
 
-    def dropEvent(self, event) -> None:
+    def dropEvent(self, event) -> None:  # noqa: N802 - Qt naming
         for url in event.mimeData().urls():
             path = url.toLocalFile()
             if path.lower().endswith(".npy"):
@@ -685,7 +688,7 @@ class MainWindow(QMainWindow):
 
     # ---------------------------------------------------------------- shutdown
 
-    def closeEvent(self, event) -> None:
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
         if self._filter_worker is not None and self._filter_worker.isRunning():
             self._filter_worker.cancel()
             self._filter_worker.wait(3000)

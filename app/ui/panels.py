@@ -1,17 +1,19 @@
-"""Dock panels: navigation, display, filters and volume management."""
+"""Dockable control panels: slice navigation, display settings and filters."""
 
 from __future__ import annotations
 
-import numpy as np
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFormLayout,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QListWidget,
+    QListWidgetItem,
     QPushButton,
     QSlider,
     QSpinBox,
@@ -24,171 +26,160 @@ from ..core.volume import AXIS_ILINE, AXIS_NAMES, AXIS_TIME, AXIS_XLINE, Seismic
 from .display import COLORMAPS, DisplaySettings
 
 
-# ===================================================================
-#  Slice Navigator
-# ===================================================================
-
-
 class SliceNavigator(QWidget):
-    """Direction combo + index slider/spin for picking a 2D section."""
+    """Pick the section orientation and step through the cube."""
 
     sliceChanged = pyqtSignal(int, int)   # axis, index
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self._volume: SeismicVolume | None = None
+        self.volume: SeismicVolume | None = None
+        self._indices: dict[int, int] = {}
+        self._axis = AXIS_ILINE
         self._updating = False
-        # Remember the last position on each axis so switching back
-        # returns to where the user was.
-        self._indices: dict[int, int] = {AXIS_ILINE: 0, AXIS_XLINE: 0, AXIS_TIME: 0}
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setContentsMargins(6, 6, 6, 6)
 
-        # -- direction -------------------------------------------------------
-        dir_row = QHBoxLayout()
-        dir_row.addWidget(QLabel("Direction"))
-        self.direction = QComboBox()
+        form = QFormLayout()
+        self.axis_combo = QComboBox()
         for axis in (AXIS_ILINE, AXIS_XLINE, AXIS_TIME):
-            self.direction.addItem(AXIS_NAMES[axis], axis)
-        dir_row.addWidget(self.direction, 1)
-        layout.addLayout(dir_row)
+            self.axis_combo.addItem(AXIS_NAMES[axis], axis)
+        self.axis_combo.currentIndexChanged.connect(self._axis_changed)
+        form.addRow("Direction", self.axis_combo)
+        layout.addLayout(form)
 
-        # -- slider -----------------------------------------------------------
         self.slider = QSlider(Qt.Orientation.Horizontal)
-        self.slider.setMinimum(0)
-        self.slider.setMaximum(0)
+        self.slider.valueChanged.connect(self._index_changed)
         layout.addWidget(self.slider)
 
-        # -- spin + label -----------------------------------------------------
-        spin_row = QHBoxLayout()
-        spin_row.addWidget(QLabel("Index"))
+        row = QHBoxLayout()
+        self.prev_button = QPushButton("<")
+        self.prev_button.setFixedWidth(30)
+        self.prev_button.clicked.connect(lambda: self.step(-1))
+        row.addWidget(self.prev_button)
+
         self.spin = QSpinBox()
-        self.spin.setMinimum(0)
-        self.spin.setMaximum(0)
-        spin_row.addWidget(self.spin, 1)
-        self.pos_label = QLabel("")
-        spin_row.addWidget(self.pos_label)
-        layout.addLayout(spin_row)
+        self.spin.valueChanged.connect(self._index_changed)
+        row.addWidget(self.spin, 1)
 
-        # -- step buttons -----------------------------------------------------
-        step_row = QHBoxLayout()
-        for text, delta in (("◀◀", -10), ("◀", -1), ("▶", 1), ("▶▶", 10)):
-            btn = QPushButton(text)
-            btn.setMaximumWidth(42)
-            btn.clicked.connect(lambda _=False, d=delta: self._step(d))
-            step_row.addWidget(btn)
-        layout.addLayout(step_row)
+        self.next_button = QPushButton(">")
+        self.next_button.setFixedWidth(30)
+        self.next_button.clicked.connect(lambda: self.step(1))
+        row.addWidget(self.next_button)
+        layout.addLayout(row)
 
+        self.label = QLabel("-")
+        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.label.setStyleSheet("color:#9aa4b2;")
+        layout.addWidget(self.label)
         layout.addStretch(1)
 
-        # -- wiring -----------------------------------------------------------
-        self.direction.currentIndexChanged.connect(self._direction_changed)
-        self.slider.valueChanged.connect(self._index_changed)
-        self.spin.valueChanged.connect(self._index_changed)
+        self.setEnabled(False)
 
-    # --------------------------------------------------------------- public
+    # ------------------------------------------------------------------ state
 
     @property
     def axis(self) -> int:
-        return self.direction.currentData()
+        return self._axis
 
     @property
     def index(self) -> int:
-        return self.slider.value()
+        return self._indices[self._axis]
 
     def set_volume(self, volume: SeismicVolume | None) -> None:
-        self._volume = volume
-        self._indices = {AXIS_ILINE: 0, AXIS_XLINE: 0, AXIS_TIME: 0}
-        if volume is not None:
-            for ax in (AXIS_ILINE, AXIS_XLINE, AXIS_TIME):
-                self._indices[ax] = volume.axis_size(ax) // 2
-        self._apply_axis()
+        self.volume = volume
+        self.setEnabled(volume is not None)
+        if volume is None:
+            return
+
+        # Keep the current position where possible; a volume opened for the
+        # first time starts in the middle of the cube, where there is data.
+        for axis in (AXIS_ILINE, AXIS_XLINE, AXIS_TIME):
+            size = volume.axis_size(axis)
+            if axis in self._indices:
+                self._indices[axis] = min(self._indices[axis], size - 1)
+            else:
+                self._indices[axis] = size // 2
+        self._refresh_range(emit=True)
 
     def set_slice(self, axis: int, index: int) -> None:
-        """Programmatic jump (e.g. from the 3D view)."""
-        self._updating = True
-        try:
-            combo_idx = self.direction.findData(axis)
-            if combo_idx >= 0 and self.direction.currentIndex() != combo_idx:
-                self._indices[self.axis] = self.slider.value()
-                self.direction.setCurrentIndex(combo_idx)
-            self.slider.setValue(int(index))
-            self.spin.setValue(int(index))
-        finally:
-            self._updating = False
-        self._emit()
+        """Programmatic move, e.g. from the 3D view."""
+        if self.volume is None:
+            return
+        index = max(0, min(index, self.volume.axis_size(axis) - 1))
+        if axis != self._axis:
+            self._axis = axis
+            self._updating = True
+            try:
+                self.axis_combo.setCurrentIndex(self.axis_combo.findData(axis))
+            finally:
+                self._updating = False
+        self._indices[axis] = index
+        self._refresh_range(emit=True)
 
-    # --------------------------------------------------------------- private
+    def step(self, delta: int) -> None:
+        if self.volume is None:
+            return
+        self.spin.setValue(self.index + delta)
 
-    def _apply_axis(self) -> None:
-        self._updating = True
-        try:
-            axis = self.axis
-            vol = self._volume
-            n = vol.axis_size(axis) if vol else 0
-            maximum = max(0, n - 1)
-            idx = min(self._indices.get(axis, 0), maximum)
-            self.slider.setMaximum(maximum)
-            self.spin.setMaximum(maximum)
-            self.slider.setValue(idx)
-            self.spin.setValue(idx)
-            self._update_label()
-        finally:
-            self._updating = False
-        self._emit()
+    # --------------------------------------------------------------- internals
 
-    def _direction_changed(self, _combo_idx: int) -> None:
-        prev_axis = None
-        for ax in (AXIS_ILINE, AXIS_XLINE, AXIS_TIME):
-            if ax != self.axis:
-                if self._indices.get(ax) == self.slider.value():
-                    prev_axis = ax
-                    break
-        if prev_axis is not None:
-            self._indices[prev_axis] = self.slider.value()
-        else:
-            for ax in (AXIS_ILINE, AXIS_XLINE, AXIS_TIME):
-                if ax != self.axis:
-                    pass
-            self._indices[self.axis] = self._indices.get(self.axis, 0)
-        self._apply_axis()
-
-    def _index_changed(self, value: int) -> None:
+    def _axis_changed(self, _row: int) -> None:
         if self._updating:
             return
+        self._axis = self.axis_combo.currentData()
+        self._refresh_range(emit=True)
+
+    def _refresh_range(self, emit: bool) -> None:
+        if self.volume is None:
+            return
+        size = self.volume.axis_size(self._axis)
+        index = min(self._indices[self._axis], size - 1)
+
+        self._updating = True
+        try:
+            for control in (self.slider, self.spin):
+                control.setRange(0, size - 1)
+                control.setValue(index)
+        finally:
+            self._updating = False
+
+        self._indices[self._axis] = index
+        self._update_label()
+        if emit:
+            self.sliceChanged.emit(self._axis, index)
+
+    def _index_changed(self, value: int) -> None:
+        if self._updating or self.volume is None:
+            return
+        value = max(0, min(value, self.volume.axis_size(self._axis) - 1))
+
         self._updating = True
         try:
             self.slider.setValue(value)
             self.spin.setValue(value)
-            self._indices[self.axis] = value
-            self._update_label()
         finally:
             self._updating = False
-        self._emit()
 
-    def _step(self, delta: int) -> None:
-        self.slider.setValue(self.slider.value() + delta)
+        self._indices[self._axis] = value
+        self._update_label()
+        self.sliceChanged.emit(self._axis, value)
 
     def _update_label(self) -> None:
-        vol = self._volume
-        if vol is None:
-            self.pos_label.setText("")
+        if self.volume is None:
+            self.label.setText("-")
             return
-        self.pos_label.setText(vol.geometry.axis_label(self.axis, self.slider.value()))
-
-    def _emit(self) -> None:
-        if not self._updating:
-            self.sliceChanged.emit(self.axis, self.index)
-
-
-# ===================================================================
-#  Display Controls
-# ===================================================================
+        geometry = self.volume.geometry
+        index = self._indices[self._axis]
+        size = self.volume.axis_size(self._axis)
+        self.label.setText(
+            "%s   (index %d of %d)" % (geometry.axis_label(self._axis, index), index, size - 1)
+        )
 
 
 class DisplayControls(QWidget):
-    """Colormap picker and amplitude window controls."""
+    """Colormap and amplitude window, shared by every view."""
 
     def __init__(self, settings: DisplaySettings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -196,226 +187,204 @@ class DisplayControls(QWidget):
         self._updating = False
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setContentsMargins(6, 6, 6, 6)
+        form = QFormLayout()
 
-        # -- colormap ---------------------------------------------------------
-        cmap_group = QGroupBox("Colour map")
-        cmap_box = QVBoxLayout(cmap_group)
-
-        cmap_row = QHBoxLayout()
         self.cmap_combo = QComboBox()
         self.cmap_combo.addItems(COLORMAPS)
         self.cmap_combo.setCurrentText(settings.cmap)
-        cmap_row.addWidget(self.cmap_combo, 1)
+        self.cmap_combo.currentTextChanged.connect(
+            lambda name: self.settings.set_cmap(name)
+        )
+        form.addRow("Colormap", self.cmap_combo)
 
         self.reverse_box = QCheckBox("Reverse")
-        self.reverse_box.setChecked(settings.reverse_cmap)
-        cmap_row.addWidget(self.reverse_box)
-        cmap_box.addLayout(cmap_row)
-        layout.addWidget(cmap_group)
+        self.reverse_box.toggled.connect(self.settings.set_reverse)
+        form.addRow("", self.reverse_box)
 
-        # -- amplitude window -------------------------------------------------
-        amp_group = QGroupBox("Amplitude window")
-        amp_box = QVBoxLayout(amp_group)
-
-        self.auto_box = QCheckBox("Auto clip")
+        self.auto_box = QCheckBox("Auto clip per slice")
         self.auto_box.setChecked(settings.auto_levels)
-        amp_box.addWidget(self.auto_box)
+        self.auto_box.toggled.connect(self.settings.set_auto_levels)
+        form.addRow("", self.auto_box)
 
-        pct_row = QHBoxLayout()
-        pct_row.addWidget(QLabel("Percentile"))
-        self.pct_spin = QDoubleSpinBox()
-        self.pct_spin.setRange(50.0, 100.0)
-        self.pct_spin.setSingleStep(0.5)
-        self.pct_spin.setValue(settings.percentile)
-        pct_row.addWidget(self.pct_spin)
-        amp_box.addLayout(pct_row)
+        self.percentile_spin = QDoubleSpinBox()
+        self.percentile_spin.setRange(50.0, 100.0)
+        self.percentile_spin.setSingleStep(0.5)
+        self.percentile_spin.setDecimals(1)
+        self.percentile_spin.setValue(settings.percentile)
+        self.percentile_spin.setToolTip(
+            "Amplitude percentile used when auto clipping; lower values give a "
+            "harder, higher-contrast display."
+        )
+        self.percentile_spin.valueChanged.connect(self.settings.set_percentile)
+        form.addRow("Clip percentile", self.percentile_spin)
 
-        min_row = QHBoxLayout()
-        min_row.addWidget(QLabel("Min"))
         self.min_spin = QDoubleSpinBox()
-        self.min_spin.setRange(-1e9, 1e9)
-        self.min_spin.setDecimals(4)
-        self.min_spin.setValue(settings.levels[0])
-        min_row.addWidget(self.min_spin)
-        amp_box.addLayout(min_row)
-
-        max_row = QHBoxLayout()
-        max_row.addWidget(QLabel("Max"))
         self.max_spin = QDoubleSpinBox()
-        self.max_spin.setRange(-1e9, 1e9)
-        self.max_spin.setDecimals(4)
-        self.max_spin.setValue(settings.levels[1])
-        max_row.addWidget(self.max_spin)
-        amp_box.addLayout(max_row)
+        for spin in (self.min_spin, self.max_spin):
+            spin.setRange(-1e9, 1e9)
+            spin.setDecimals(4)
+            spin.setSingleStep(0.05)
+            spin.valueChanged.connect(self._levels_edited)
+        form.addRow("Min amplitude", self.min_spin)
+        form.addRow("Max amplitude", self.max_spin)
 
-        btn_row = QHBoxLayout()
-        sym_btn = QPushButton("Make symmetric")
-        sym_btn.setToolTip("Set min = -max so zero stays in the middle of the colormap")
-        sym_btn.clicked.connect(self._make_symmetric)
-        btn_row.addWidget(sym_btn)
+        layout.addLayout(form)
 
-        rescale_btn = QPushButton("Rescale now")
-        rescale_btn.setToolTip("Recompute levels from the currently displayed section")
-        rescale_btn.clicked.connect(self._rescale_now)
-        btn_row.addWidget(rescale_btn)
-        amp_box.addLayout(btn_row)
+        buttons = QHBoxLayout()
+        symmetric = QPushButton("Make symmetric")
+        symmetric.setToolTip("Centre the amplitude window on zero")
+        symmetric.clicked.connect(self._make_symmetric)
+        buttons.addWidget(symmetric)
 
-        layout.addWidget(amp_group)
+        rescale = QPushButton("Rescale now")
+        rescale.setToolTip("Re-apply auto clipping to the slice on screen")
+        rescale.clicked.connect(lambda: self.settings.set_auto_levels(True))
+        buttons.addWidget(rescale)
+        layout.addLayout(buttons)
+
+        hint = QLabel(
+            "The colour bar beside each section is draggable: pull its ends to "
+            "stretch the amplitude window, or drag its middle to shift it."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#9aa4b2;")
+        layout.addWidget(hint)
         layout.addStretch(1)
 
-        # -- wiring -----------------------------------------------------------
-        self.cmap_combo.currentTextChanged.connect(self._cmap_changed)
-        self.reverse_box.toggled.connect(self._cmap_changed)
-        self.auto_box.toggled.connect(self._auto_changed)
-        self.pct_spin.valueChanged.connect(self._pct_changed)
-        self.min_spin.valueChanged.connect(self._levels_changed)
-        self.max_spin.valueChanged.connect(self._levels_changed)
         settings.changed.connect(self._pull_from_settings)
+        self._pull_from_settings()
 
-    # --------------------------------------------------------------- slots
+    def _pull_from_settings(self) -> None:
+        self._updating = True
+        try:
+            low, high = self.settings.levels
+            self.min_spin.setValue(low)
+            self.max_spin.setValue(high)
+            self.auto_box.setChecked(self.settings.auto_levels)
+            self.cmap_combo.setCurrentText(self.settings.cmap)
+            self.reverse_box.setChecked(self.settings.reverse)
+        finally:
+            self._updating = False
 
-    def _cmap_changed(self, _: object = None) -> None:
-        self.settings.set_cmap(self.cmap_combo.currentText(), self.reverse_box.isChecked())
-
-    def _auto_changed(self, on: bool) -> None:
-        self.settings.set_auto_levels(on)
-
-    def _pct_changed(self, val: float) -> None:
-        self.settings.set_percentile(val)
-
-    def _levels_changed(self, _: float = 0.0) -> None:
+    def _levels_edited(self, _value: float) -> None:
         if self._updating:
             return
         self.settings.set_levels(self.min_spin.value(), self.max_spin.value(), from_user=True)
 
     def _make_symmetric(self) -> None:
-        lim = max(abs(self.min_spin.value()), abs(self.max_spin.value()))
-        self.settings.set_levels(-lim, lim, from_user=True)
-
-    def _rescale_now(self) -> None:
-        self.settings.set_auto_levels(True)
-        self.auto_box.setChecked(True)
-
-    def _pull_from_settings(self) -> None:
-        self._updating = True
-        try:
-            self.cmap_combo.setCurrentText(self.settings.cmap)
-            self.reverse_box.setChecked(self.settings.reverse_cmap)
-            self.auto_box.setChecked(self.settings.auto_levels)
-            self.pct_spin.setValue(self.settings.percentile)
-            vmin, vmax = self.settings.levels
-            self.min_spin.setValue(vmin)
-            self.max_spin.setValue(vmax)
-        finally:
-            self._updating = False
-
-
-# ===================================================================
-#  Filter Controls
-# ===================================================================
+        low, high = self.settings.levels
+        level = max(abs(low), abs(high)) or 1.0
+        self.settings.set_levels(-level, level, from_user=True)
 
 
 class FilterControls(QWidget):
-    """Gaussian smoothing and sharpening parameter panel."""
+    """Gaussian smoothing and sharpening parameters plus the apply actions."""
 
-    previewRequested = pyqtSignal(str)    # "smooth" | "sharpen"
-    applyToVolume = pyqtSignal(str)       # "smooth" | "sharpen"
     paramsChanged = pyqtSignal()
+    previewRequested = pyqtSignal(str)      # "smooth" | "sharpen" | "none"
+    applyToVolume = pyqtSignal(str)         # "smooth" | "sharpen"
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setContentsMargins(6, 6, 6, 6)
 
-        # -- smooth -----------------------------------------------------------
+        # -- Gaussian --------------------------------------------------------
         smooth_group = QGroupBox("Gaussian smoothing")
-        sg = QVBoxLayout(smooth_group)
+        smooth_form = QFormLayout(smooth_group)
 
-        row = QHBoxLayout()
-        row.addWidget(QLabel("σ trace"))
         self.sigma_trace = QDoubleSpinBox()
-        self.sigma_trace.setRange(0.0, 50.0)
-        self.sigma_trace.setSingleStep(0.5)
+        self.sigma_trace.setRange(0.0, 20.0)
+        self.sigma_trace.setSingleStep(0.25)
         self.sigma_trace.setValue(1.5)
-        row.addWidget(self.sigma_trace)
-        row.addWidget(QLabel("σ time"))
-        self.sigma_time = QDoubleSpinBox()
-        self.sigma_time.setRange(0.0, 50.0)
-        self.sigma_time.setSingleStep(0.5)
-        self.sigma_time.setValue(1.5)
-        row.addWidget(self.sigma_time)
-        sg.addLayout(row)
+        self.sigma_trace.setToolTip("Standard deviation across traces, in bins")
+        self.sigma_trace.valueChanged.connect(lambda _: self.paramsChanged.emit())
+        smooth_form.addRow("Sigma (traces)", self.sigma_trace)
 
-        btn_row = QHBoxLayout()
+        self.sigma_time = QDoubleSpinBox()
+        self.sigma_time.setRange(0.0, 20.0)
+        self.sigma_time.setSingleStep(0.25)
+        self.sigma_time.setValue(1.5)
+        self.sigma_time.setToolTip("Standard deviation along time, in samples")
+        self.sigma_time.valueChanged.connect(lambda _: self.paramsChanged.emit())
+        smooth_form.addRow("Sigma (time)", self.sigma_time)
+
+        smooth_buttons = QHBoxLayout()
         preview_smooth = QPushButton("Preview on slice")
         preview_smooth.clicked.connect(lambda: self.previewRequested.emit("smooth"))
-        btn_row.addWidget(preview_smooth)
+        smooth_buttons.addWidget(preview_smooth)
+
         apply_smooth = QPushButton("Apply to volume")
+        apply_smooth.setToolTip("Create a new smoothed volume for side-by-side comparison")
         apply_smooth.clicked.connect(lambda: self.applyToVolume.emit("smooth"))
-        btn_row.addWidget(apply_smooth)
-        sg.addLayout(btn_row)
+        smooth_buttons.addWidget(apply_smooth)
+        smooth_form.addRow(smooth_buttons)
         layout.addWidget(smooth_group)
 
-        # -- sharpen ----------------------------------------------------------
+        # -- Sharpening ------------------------------------------------------
         sharpen_group = QGroupBox("Image sharpening")
-        shg = QVBoxLayout(sharpen_group)
+        sharpen_form = QFormLayout(sharpen_group)
 
-        method_row = QHBoxLayout()
-        method_row.addWidget(QLabel("Method"))
         self.method_combo = QComboBox()
         self.method_combo.addItems(["unsharp", "laplacian"])
-        method_row.addWidget(self.method_combo, 1)
-        shg.addLayout(method_row)
+        self.method_combo.setToolTip(
+            "unsharp: add back the difference from a blurred copy\n"
+            "laplacian: add back a discrete second derivative"
+        )
+        self.method_combo.currentTextChanged.connect(lambda _: self.paramsChanged.emit())
+        sharpen_form.addRow("Method", self.method_combo)
 
-        params_row = QHBoxLayout()
-        params_row.addWidget(QLabel("σ"))
         self.sharpen_sigma = QDoubleSpinBox()
-        self.sharpen_sigma.setRange(0.1, 50.0)
-        self.sharpen_sigma.setSingleStep(0.5)
+        self.sharpen_sigma.setRange(0.1, 20.0)
+        self.sharpen_sigma.setSingleStep(0.25)
         self.sharpen_sigma.setValue(1.0)
-        params_row.addWidget(self.sharpen_sigma)
-        params_row.addWidget(QLabel("Amount"))
+        self.sharpen_sigma.setToolTip("Blur radius used to build the detail image")
+        self.sharpen_sigma.valueChanged.connect(lambda _: self.paramsChanged.emit())
+        sharpen_form.addRow("Sigma", self.sharpen_sigma)
+
         self.amount = QDoubleSpinBox()
-        self.amount.setRange(0.0, 20.0)
+        self.amount.setRange(0.0, 10.0)
         self.amount.setSingleStep(0.1)
         self.amount.setValue(1.0)
-        params_row.addWidget(self.amount)
-        shg.addLayout(params_row)
+        self.amount.setToolTip("How much of the detail image is added back")
+        self.amount.valueChanged.connect(lambda _: self.paramsChanged.emit())
+        sharpen_form.addRow("Amount", self.amount)
 
-        btn_row2 = QHBoxLayout()
+        sharpen_buttons = QHBoxLayout()
         preview_sharpen = QPushButton("Preview on slice")
         preview_sharpen.clicked.connect(lambda: self.previewRequested.emit("sharpen"))
-        btn_row2.addWidget(preview_sharpen)
+        sharpen_buttons.addWidget(preview_sharpen)
+
         apply_sharpen = QPushButton("Apply to volume")
         apply_sharpen.clicked.connect(lambda: self.applyToVolume.emit("sharpen"))
-        btn_row2.addWidget(apply_sharpen)
-        shg.addLayout(btn_row2)
+        sharpen_buttons.addWidget(apply_sharpen)
+        sharpen_form.addRow(sharpen_buttons)
         layout.addWidget(sharpen_group)
 
-        # -- live preview -----------------------------------------------------
-        self.live_box = QCheckBox("Live preview")
-        self.live_box.setToolTip("Update the comparison view as sliders move")
+        self.live_box = QCheckBox("Live preview while editing")
         self.live_box.setChecked(True)
+        self.live_box.setToolTip(
+            "Recompute the comparison panel as soon as a parameter changes"
+        )
         layout.addWidget(self.live_box)
 
+        note = QLabel(
+            "'Preview on slice' filters only the section on screen and shows it "
+            "in the Compare tab. 'Apply to volume' filters the whole cube and "
+            "adds it to the volume list."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#9aa4b2;")
+        layout.addWidget(note)
         layout.addStretch(1)
 
-        # -- wiring -----------------------------------------------------------
-        for spin in (self.sigma_trace, self.sigma_time, self.sharpen_sigma, self.amount):
-            spin.valueChanged.connect(lambda _: self.paramsChanged.emit())
-        self.method_combo.currentTextChanged.connect(lambda _: self.paramsChanged.emit())
-
-    # ----------------------------------------------------------- accessors
-
-    @property
-    def live_preview(self) -> bool:
-        return self.live_box.isChecked()
+    # ------------------------------------------------------------------ values
 
     def smooth_params(self) -> SmoothParams:
         return SmoothParams(
-            sigma_trace=self.sigma_trace.value(),
-            sigma_time=self.sigma_time.value(),
+            sigma_trace=self.sigma_trace.value(), sigma_time=self.sigma_time.value()
         )
 
     def sharpen_params(self) -> SharpenParams:
@@ -425,57 +394,54 @@ class FilterControls(QWidget):
             method=self.method_combo.currentText(),
         )
 
-
-# ===================================================================
-#  Volume Panel
-# ===================================================================
+    @property
+    def live_preview(self) -> bool:
+        return self.live_box.isChecked()
 
 
 class VolumePanel(QWidget):
-    """Lists loaded volumes and shows the summary of the active one."""
+    """List of loaded cubes; the highlighted one drives every view."""
 
     activeChanged = pyqtSignal(int)
     removeRequested = pyqtSignal(int)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setContentsMargins(6, 6, 6, 6)
 
-        self.volume_list = QListWidget()
-        self.volume_list.setMaximumHeight(100)
-        layout.addWidget(self.volume_list)
+        self.list = QListWidget()
+        self.list.currentRowChanged.connect(self._row_changed)
+        layout.addWidget(self.list, 1)
 
-        remove = QPushButton("Remove selected")
-        remove.clicked.connect(self._remove)
-        layout.addWidget(remove)
+        row = QHBoxLayout()
+        remove = QPushButton("Remove")
+        remove.clicked.connect(lambda: self.removeRequested.emit(self.list.currentRow()))
+        row.addWidget(remove)
+        layout.addLayout(row)
 
-        self.summary = QLabel("")
-        self.summary.setWordWrap(True)
-        self.summary.setStyleSheet("color: #aaa; font-size: 11px;")
-        layout.addWidget(self.summary)
-
-        layout.addStretch(1)
-
-        self.volume_list.currentRowChanged.connect(self._selection_changed)
+        self.info = QLabel("No volume loaded.")
+        self.info.setWordWrap(True)
+        self.info.setStyleSheet("font-family: Consolas, monospace; color:#9aa4b2;")
+        layout.addWidget(self.info)
 
     def refresh(self, volumes: list[SeismicVolume], active: int) -> None:
-        self.volume_list.blockSignals(True)
-        self.volume_list.clear()
-        for vol in volumes:
-            self.volume_list.addItem(vol.name)
+        self.list.blockSignals(True)
+        self.list.clear()
+        for volume in volumes:
+            item = QListWidgetItem(
+                "%s   [%d x %d x %d]"
+                % (volume.name, volume.n_iline, volume.n_xline, volume.n_time)
+            )
+            item.setToolTip(volume.path or "in memory")
+            self.list.addItem(item)
         if 0 <= active < len(volumes):
-            self.volume_list.setCurrentRow(active)
-            self.summary.setText(volumes[active].summary())
-        else:
-            self.summary.setText("")
-        self.volume_list.blockSignals(False)
+            self.list.setCurrentRow(active)
+        self.list.blockSignals(False)
 
-    def _selection_changed(self, row: int) -> None:
+        self.info.setText(volumes[active].summary() if 0 <= active < len(volumes) else "")
+
+    def _row_changed(self, row: int) -> None:
         if row >= 0:
             self.activeChanged.emit(row)
-
-    def _remove(self) -> None:
-        row = self.volume_list.currentRow()
-        if row >= 0:
-            self.removeRequested.emit(row)

@@ -1,3 +1,15 @@
+"""Interactive 3D volume view built on PyVista / VTK.
+
+Slices are not cut out of the full cube with a VTK cutter - that would mean
+re-cutting nine million points every time a slider moves. Each slice is instead
+its own flat ``ImageData`` whose scalars are the corresponding numpy section,
+so moving a slice is a cheap origin update plus one array swap.
+
+Time runs downwards on screen: the world z axis carries positive time and the
+camera is set up with ``up = (0, 0, -1)``, which keeps the depth ticks positive
+while preserving the usual seismic look.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -173,373 +185,464 @@ class Volume3DView(QWidget):
         reset.clicked.connect(lambda: self.set_camera_preset(self.view_combo.currentText()))
         scene.addWidget(reset)
 
+        self.hint = QLabel(
+            "Left drag rotates, wheel zooms,\nmiddle drag pans, right drag dollies."
+        )
+        self.hint.setStyleSheet("color:#888;")
+        self.hint.setWordWrap(True)
+        scene.addWidget(self.hint)
+
         box.addWidget(scene_group)
         box.addStretch(1)
         return panel
 
-    # ----------------------------------------------------------------- state
+    # ----------------------------------------------------------------- volume
 
     @property
     def available(self) -> bool:
         return PYVISTA_AVAILABLE and self.plotter is not None
 
-    # ---------------------------------------------------------------- volume
-
     def set_volume(self, volume: SeismicVolume | None) -> None:
         if not self.available:
             return
+
+        self.clear()
         self.volume = volume
-        self._clear_scene()
         if volume is None:
+            self.plotter.render()
             return
 
         self._spacing = self._compute_spacing(volume)
-        self._add_outline(volume)
+        self._add_outline()
 
-        # Default slices: one of each axis through the middle.
-        for axis in (AXIS_ILINE, AXIS_XLINE, AXIS_TIME):
-            self.add_slice(axis, volume.axis_size(axis) // 2)
+        # A starting arrangement that immediately shows the cube's interior.
+        self.add_slice(AXIS_ILINE, volume.n_iline // 2, render=False)
+        self.add_slice(AXIS_XLINE, volume.n_xline // 2, render=False)
+        self.add_slice(AXIS_TIME, volume.n_time // 2, render=False)
 
-        self._apply_bounds()
-        self.set_camera_preset("Isometric")
+        self._toggle_bounds(self.axes_box.isChecked())
+        self.set_camera_preset(self.view_combo.currentText())
+        self.plotter.render()
 
     def _compute_spacing(self, volume: SeismicVolume) -> tuple[float, float, float]:
+        """World units per index.
+
+        The bin spacing is normalised so the cube keeps a sensible shape
+        whatever the survey dimensions, and time is exaggerated a little
+        because a flat pancake is hard to interpret.
+        """
         longest = max(volume.n_iline, volume.n_xline)
         return (
-            100.0 / max(longest, 1),
-            100.0 / max(longest, 1),
+            100.0 / longest,
+            100.0 / longest,
             70.0 / max(volume.n_time, 1),
         )
 
-    # --------------------------------------------------------------- outline
-
-    def _add_outline(self, volume: SeismicVolume) -> None:
+    def clear(self) -> None:
         if not self.available:
             return
-        sx, sy, sz = self._spacing
-        bounds = [
-            0, volume.n_iline * sx,
-            0, volume.n_xline * sy,
-            0, volume.n_time * sz,
-        ]
-        mesh = pv.Box(bounds=bounds)
-        self._outline_actor = self.plotter.add_mesh(
-            mesh, style="wireframe", color="#555555", line_width=1.5, name="outline"
+        self._disable_plane_widget()
+        for plane in self.planes:
+            try:
+                self.plotter.remove_actor(plane.actor, render=False)
+            except Exception:
+                pass
+        self.planes.clear()
+        self.slice_list.clear()
+
+        if self._outline_actor is not None:
+            try:
+                self.plotter.remove_actor(self._outline_actor, render=False)
+            except Exception:
+                pass
+            self._outline_actor = None
+
+        try:
+            self.plotter.remove_scalar_bar()
+        except Exception:
+            pass
+        self.volume = None
+
+    # ----------------------------------------------------------------- slices
+
+    def add_slice(self, axis: int, index: int | None = None, render: bool = True) -> None:
+        if not self.available or self.volume is None:
+            return
+
+        n = self.volume.axis_size(axis)
+        if index is None:
+            index = n // 2
+        index = int(np.clip(index, 0, n - 1))
+
+        mesh = self._make_plane_mesh(axis, index)
+        actor = self.plotter.add_mesh(
+            mesh,
+            scalars="amplitude",
+            cmap=vtk_colormap_name(self.settings.cmap, self.settings.reverse),
+            clim=self.settings.levels,
+            lighting=False,
+            show_scalar_bar=False,
+            interpolate_before_map=True,
+            name="slice_%d_%d" % (axis, len(self.planes)),
         )
+
+        plane = SlicePlane(axis=axis, index=index, mesh=mesh, actor=actor)
+        self.planes.append(plane)
+
+        item = QListWidgetItem(plane.label(self.volume))
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        item.setCheckState(Qt.CheckState.Checked)
+        self.slice_list.addItem(item)
+        self.slice_list.setCurrentRow(self.slice_list.count() - 1)
+
+        self._refresh_scalar_bar()
+        if self.axes_box.isChecked():
+            self._toggle_bounds(True)
+        if render:
+            self.plotter.render()
+
+    def _make_plane_mesh(self, axis: int, index: int):
+        """A flat ImageData carrying the section's amplitudes as point scalars."""
+        assert self.volume is not None
+        sx, sy, sz = self._spacing
+        n_il, n_xl, n_t = self.volume.shape
+        section = self.volume.slice(axis, index)
+
+        if axis == AXIS_ILINE:                      # (n_xl, n_t)
+            dims = (1, n_xl, n_t)
+            origin = (index * sx, 0.0, 0.0)
+        elif axis == AXIS_XLINE:                    # (n_il, n_t)
+            dims = (n_il, 1, n_t)
+            origin = (0.0, index * sy, 0.0)
+        else:                                       # (n_il, n_xl)
+            dims = (n_il, n_xl, 1)
+            origin = (0.0, 0.0, index * sz)
+
+        mesh = pv.ImageData(dimensions=dims, spacing=(sx, sy, sz), origin=origin)
+        # ImageData expects x to vary fastest; the sections above are already
+        # ordered so that Fortran flattening produces exactly that.
+        mesh.point_data["amplitude"] = np.ascontiguousarray(
+            section.flatten(order="F"), dtype=np.float32
+        )
+        return mesh
+
+    def move_slice(self, position: int, index: int, render: bool = True) -> None:
+        """Slide an existing plane to a new index without rebuilding the actor."""
+        if not self.available or self.volume is None:
+            return
+        if not (0 <= position < len(self.planes)):
+            return
+
+        plane = self.planes[position]
+        n = self.volume.axis_size(plane.axis)
+        index = int(np.clip(index, 0, n - 1))
+        if index == plane.index:
+            return
+
+        sx, sy, sz = self._spacing
+        plane.index = index
+        if plane.axis == AXIS_ILINE:
+            plane.mesh.origin = (index * sx, 0.0, 0.0)
+        elif plane.axis == AXIS_XLINE:
+            plane.mesh.origin = (0.0, index * sy, 0.0)
+        else:
+            plane.mesh.origin = (0.0, 0.0, index * sz)
+
+        section = self.volume.slice(plane.axis, index)
+        plane.mesh.point_data["amplitude"] = np.ascontiguousarray(
+            section.flatten(order="F"), dtype=np.float32
+        )
+
+        item = self.slice_list.item(position)
+        if item is not None:
+            item.setText(plane.label(self.volume))
+
+        if render:
+            self.plotter.render()
+        self.sliceChanged.emit(plane.axis, index)
+
+    def remove_selected(self) -> None:
+        row = self.slice_list.currentRow()
+        if not self.available or not (0 <= row < len(self.planes)):
+            return
+
+        self._disable_plane_widget()
+        plane = self.planes.pop(row)
+        try:
+            self.plotter.remove_actor(plane.actor, render=False)
+        except Exception:
+            pass
+        self.slice_list.takeItem(row)
+        self._refresh_scalar_bar()
+        if self.axes_box.isChecked():
+            self._toggle_bounds(True)
+        self.plotter.render()
+
+    def set_slice_for_axis(self, axis: int, index: int) -> None:
+        """Sync helper: move the first plane on ``axis``, or create one."""
+        for position, plane in enumerate(self.planes):
+            if plane.axis == axis:
+                self.move_slice(position, index)
+                if self.slice_list.currentRow() == position:
+                    self._sync_position_controls(plane)
+                return
+        self.add_slice(axis, index)
+
+    # -------------------------------------------------------------- selection
+
+    def _selection_changed(self, row: int) -> None:
+        if not (0 <= row < len(self.planes)):
+            self.position_slider.setEnabled(False)
+            self.position_spin.setEnabled(False)
+            self._disable_plane_widget()
+            return
+
+        plane = self.planes[row]
+        self._sync_position_controls(plane)
+        if self.drag_box.isChecked():
+            self._enable_plane_widget(plane)
+
+    def _sync_position_controls(self, plane: SlicePlane) -> None:
+        if self.volume is None:
+            return
+        n = self.volume.axis_size(plane.axis)
+
+        self._updating = True
+        try:
+            for control in (self.position_slider, self.position_spin):
+                control.setEnabled(True)
+                control.setRange(0, n - 1)
+                control.setValue(plane.index)
+        finally:
+            self._updating = False
+
+    def _slider_moved(self, value: int) -> None:
+        if self._updating:
+            return
+        row = self.slice_list.currentRow()
+        if not (0 <= row < len(self.planes)):
+            return
+
+        self._updating = True
+        try:
+            self.position_slider.setValue(value)
+            self.position_spin.setValue(value)
+        finally:
+            self._updating = False
+
+        self.move_slice(row, value)
+        if self._widget_enabled:
+            self._enable_plane_widget(self.planes[row])
+
+    def _item_toggled(self, item: QListWidgetItem) -> None:
+        row = self.slice_list.row(item)
+        if not (0 <= row < len(self.planes)):
+            return
+        visible = item.checkState() == Qt.CheckState.Checked
+        plane = self.planes[row]
+        plane.visible = visible
+        try:
+            plane.actor.SetVisibility(visible)
+        except Exception:
+            pass
+        self.plotter.render()
+
+    # ---------------------------------------------------------- plane widget
+
+    def _toggle_plane_widget(self, on: bool) -> None:
+        row = self.slice_list.currentRow()
+        if on and 0 <= row < len(self.planes):
+            self._enable_plane_widget(self.planes[row])
+        else:
+            self._disable_plane_widget()
+
+    def _enable_plane_widget(self, plane: SlicePlane) -> None:
+        """Attach a draggable VTK plane to the selected slice."""
+        if not self.available or self.volume is None:
+            return
+        self._disable_plane_widget()
+
+        sx, sy, sz = self._spacing
+        normal = [(1, 0, 0), (0, 1, 0), (0, 0, 1)][plane.axis]
+        origin = [
+            plane.index * sx if plane.axis == AXIS_ILINE else self.volume.n_iline * sx / 2,
+            plane.index * sy if plane.axis == AXIS_XLINE else self.volume.n_xline * sy / 2,
+            plane.index * sz if plane.axis == AXIS_TIME else self.volume.n_time * sz / 2,
+        ]
+        step = (sx, sy, sz)[plane.axis]
+
+        def moved(widget_normal, widget_origin) -> None:
+            index = int(round(widget_origin[plane.axis] / step)) if step else 0
+            row = self.slice_list.currentRow()
+            if 0 <= row < len(self.planes):
+                self._updating = True
+                try:
+                    clamped = int(
+                        np.clip(index, 0, self.volume.axis_size(plane.axis) - 1)
+                    )
+                    self.position_slider.setValue(clamped)
+                    self.position_spin.setValue(clamped)
+                finally:
+                    self._updating = False
+                self.move_slice(row, index)
+
+        try:
+            self.plotter.add_plane_widget(
+                callback=moved,
+                normal=normal,
+                origin=origin,
+                normal_rotation=False,
+                outline_translation=False,
+                implicit=True,
+                factor=1.05,
+                test_callback=False,
+            )
+            self._widget_enabled = True
+        except Exception:
+            # Older or headless VTK builds may refuse; the slider still works.
+            self._widget_enabled = False
+            self.drag_box.blockSignals(True)
+            self.drag_box.setChecked(False)
+            self.drag_box.blockSignals(False)
+
+    def _disable_plane_widget(self) -> None:
+        if not self.available:
+            return
+        try:
+            self.plotter.clear_plane_widgets()
+        except Exception:
+            pass
+        self._widget_enabled = False
+
+    # ------------------------------------------------------------------ scene
+
+    def _add_outline(self) -> None:
+        if self.volume is None:
+            return
+        sx, sy, sz = self._spacing
+        n_il, n_xl, n_t = self.volume.shape
+        box = pv.Box(
+            bounds=(0.0, (n_il - 1) * sx, 0.0, (n_xl - 1) * sy, 0.0, (n_t - 1) * sz)
+        )
+        self._outline_actor = self.plotter.add_mesh(
+            box.outline(), color="#9aa4b2", line_width=1.5, name="outline"
+        )
+        self._outline_actor.SetVisibility(self.outline_box.isChecked())
 
     def _toggle_outline(self, on: bool) -> None:
         if self._outline_actor is not None:
             self._outline_actor.SetVisibility(on)
             self.plotter.render()
 
-    def _apply_bounds(self) -> None:
-        if not self.available or self.volume is None:
+    def _toggle_bounds(self, on: bool) -> None:
+        if not self.available:
             return
-        vol = self.volume
-        sx, sy, sz = self._spacing
-        if self.axes_box.isChecked():
-            self.plotter.show_bounds(
-                bounds=[0, vol.n_iline * sx, 0, vol.n_xline * sy, 0, vol.n_time * sz],
-                xlabel="Inline", ylabel="Crossline", zlabel="Time",
-                xtitle="", ytitle="", ztitle="",
-                show_xlabels=True, show_ylabels=True, show_zlabels=True,
-                color="#888888", font_size=9,
-            )
-        else:
-            try:
-                self.plotter.remove_bounds_axes()
-            except Exception:
-                pass
-
-    def _toggle_bounds(self, _on: bool) -> None:
-        self._apply_bounds()
-        self.plotter.render()
-
-    # ----------------------------------------------------------- slice mgmt
-
-    def add_slice(self, axis: int, index: int | None = None) -> None:
-        if not self.available or self.volume is None:
-            return
-        vol = self.volume
-        if index is None:
-            index = vol.axis_size(axis) // 2
-        index = int(np.clip(index, 0, vol.axis_size(axis) - 1))
-
-        mesh = self._make_plane_mesh(vol, axis, index)
-        cmap = vtk_colormap_name(self.settings.cmap)
-        clim = self.settings.levels
-        actor = self.plotter.add_mesh(
-            mesh, scalars="amplitude", cmap=cmap, clim=clim,
-            show_scalar_bar=False, name="plane_%d_%d" % (len(self.planes), axis),
-        )
-
-        plane = SlicePlane(axis=axis, index=index, mesh=mesh, actor=actor)
-        self.planes.append(plane)
-
-        item = QListWidgetItem(plane.label(vol))
-        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-        item.setCheckState(Qt.CheckState.Checked)
-        self.slice_list.addItem(item)
-        self.slice_list.setCurrentRow(self.slice_list.count() - 1)
-
-        self.plotter.render()
-
-    def _make_plane_mesh(self, volume: SeismicVolume, axis: int, index: int):
-        section = volume.slice(axis, index)
-        sx, sy, sz = self._spacing
-
-        if axis == AXIS_ILINE:
-            dims = (1, section.shape[0], section.shape[1])
-            spacing = (sx, sy, sz)
-            origin = (index * sx, 0, 0)
-        elif axis == AXIS_XLINE:
-            dims = (section.shape[0], 1, section.shape[1])
-            spacing = (sx, sy, sz)
-            origin = (0, index * sy, 0)
-        else:  # AXIS_TIME
-            dims = (section.shape[0], section.shape[1], 1)
-            spacing = (sx, sy, sz)
-            origin = (0, 0, index * sz)
-
-        mesh = pv.ImageData(dimensions=dims, spacing=spacing, origin=origin)
-        mesh.point_data["amplitude"] = section.flatten(order="F").astype(np.float32)
-        return mesh
-
-    def move_slice(self, row: int, new_index: int) -> None:
-        if not self.available or self.volume is None:
-            return
-        if not (0 <= row < len(self.planes)):
-            return
-        plane = self.planes[row]
-        vol = self.volume
-        new_index = int(np.clip(new_index, 0, vol.axis_size(plane.axis) - 1))
-        if new_index == plane.index:
-            return
-
-        plane.index = new_index
-        new_mesh = self._make_plane_mesh(vol, plane.axis, new_index)
-        plane.mesh = new_mesh
-
-        cmap = vtk_colormap_name(self.settings.cmap)
-        clim = self.settings.levels
-        self.plotter.add_mesh(
-            new_mesh, scalars="amplitude", cmap=cmap, clim=clim,
-            show_scalar_bar=False, name="plane_%d_%d" % (row, plane.axis),
-        )
-
-        item = self.slice_list.item(row)
-        if item is not None:
-            item.setText(plane.label(vol))
-
-        self.plotter.render()
-        self.sliceChanged.emit(plane.axis, new_index)
-
-    def remove_selected(self) -> None:
-        row = self.slice_list.currentRow()
-        if row < 0 or row >= len(self.planes):
-            return
-        self._remove_plane_widget()
-        plane = self.planes.pop(row)
         try:
-            self.plotter.remove_actor("plane_%d_%d" % (row, plane.axis))
+            if on and self.volume is not None:
+                # The scene uses normalised world units so the cube keeps a
+                # sensible shape; axes_ranges relabels the ticks with the real
+                # survey numbers and two-way time.
+                geometry = self.volume.geometry
+                n_il, n_xl, n_t = self.volume.shape
+                self.plotter.show_bounds(
+                    grid="back",
+                    location="outer",
+                    xtitle="Inline",
+                    ytitle="Crossline",
+                    ztitle="Time (ms)",
+                    axes_ranges=[
+                        geometry.iline_label(0),
+                        geometry.iline_label(n_il - 1),
+                        geometry.xline_label(0),
+                        geometry.xline_label(n_xl - 1),
+                        geometry.time_label(0),
+                        geometry.time_label(n_t - 1),
+                    ],
+                    color="#c8cdd4",
+                    font_size=12,
+                    n_xlabels=4,
+                    n_ylabels=4,
+                    n_zlabels=5,
+                    fmt="%.0f",
+                    use_3d_text=False,
+                )
+            else:
+                self.plotter.remove_bounds_axes()
         except Exception:
             pass
-        self.slice_list.takeItem(row)
-        # Rename remaining actors for consistency.
-        for i, p in enumerate(self.planes):
-            pass  # actors already have unique names from creation
         self.plotter.render()
 
-    def set_slice_for_axis(self, axis: int, index: int) -> None:
-        """Move the first plane on *axis* to *index*, used by 2D↔3D sync."""
-        for row, plane in enumerate(self.planes):
-            if plane.axis == axis:
-                self.move_slice(row, index)
-                return
-
-    # -------------------------------------------------------- selection / UI
-
-    def _selection_changed(self, row: int) -> None:
-        self._remove_plane_widget()
-        if not self.available or self.volume is None or not (0 <= row < len(self.planes)):
-            self.position_slider.setEnabled(False)
-            self.position_spin.setEnabled(False)
+    def _refresh_scalar_bar(self) -> None:
+        try:
+            self.plotter.remove_scalar_bar()
+        except Exception:
+            pass
+        if not self.planes:
             return
-
-        plane = self.planes[row]
-        vol = self.volume
-        maximum = vol.axis_size(plane.axis) - 1
-
-        self._updating = True
-        self.position_slider.setEnabled(True)
-        self.position_spin.setEnabled(True)
-        self.position_slider.setMaximum(maximum)
-        self.position_spin.setMaximum(maximum)
-        self.position_slider.setValue(plane.index)
-        self.position_spin.setValue(plane.index)
-        self._updating = False
-
-    def _slider_moved(self, value: int) -> None:
-        if self._updating:
-            return
-        row = self.slice_list.currentRow()
-        if row < 0:
-            return
-        self._updating = True
-        self.position_slider.setValue(value)
-        self.position_spin.setValue(value)
-        self._updating = False
-        self.move_slice(row, value)
-
-    def _item_toggled(self, item: QListWidgetItem) -> None:
-        row = self.slice_list.row(item)
-        if 0 <= row < len(self.planes):
-            visible = item.checkState() == Qt.CheckState.Checked
-            self.planes[row].visible = visible
-            if self.planes[row].actor is not None:
-                self.planes[row].actor.SetVisibility(visible)
-            self.plotter.render()
-
-    # -------------------------------------------------------- plane widget
-
-    def _toggle_plane_widget(self, on: bool) -> None:
-        if on:
-            self._add_plane_widget()
-        else:
-            self._remove_plane_widget()
-
-    def _add_plane_widget(self) -> None:
-        if not self.available or self.volume is None:
-            return
-        row = self.slice_list.currentRow()
-        if not (0 <= row < len(self.planes)):
-            return
-        plane = self.planes[row]
-        vol = self.volume
-        sx, sy, sz = self._spacing
-
-        if plane.axis == AXIS_ILINE:
-            normal, origin_pt = (1, 0, 0), (plane.index * sx, vol.n_xline * sy / 2, vol.n_time * sz / 2)
-        elif plane.axis == AXIS_XLINE:
-            normal, origin_pt = (0, 1, 0), (vol.n_iline * sx / 2, plane.index * sy, vol.n_time * sz / 2)
-        else:
-            normal, origin_pt = (0, 0, 1), (vol.n_iline * sx / 2, vol.n_xline * sy / 2, plane.index * sz)
-
-        bounds = [0, vol.n_iline * sx, 0, vol.n_xline * sy, 0, vol.n_time * sz]
-
-        def moved(normal_vec, origin_vec):
-            if plane.axis == AXIS_ILINE:
-                idx = int(round(origin_vec[0] / sx))
-            elif plane.axis == AXIS_XLINE:
-                idx = int(round(origin_vec[1] / sy))
-            else:
-                idx = int(round(origin_vec[2] / sz))
-            idx = int(np.clip(idx, 0, vol.axis_size(plane.axis) - 1))
-            if idx != plane.index:
-                self._updating = True
-                self.position_slider.setValue(idx)
-                self.position_spin.setValue(idx)
-                self._updating = False
-                self.move_slice(row, idx)
-
-        self.plotter.add_plane_widget(
-            callback=moved,
-            normal=normal,
-            origin=origin_pt,
-            bounds=bounds,
-            factor=1.0,
-            color="#ffab00",
-            assign_to_axis=None,
-            tubing=False,
-            outline_translation=False,
-        )
-        self._widget_enabled = True
-
-    def _remove_plane_widget(self) -> None:
-        if self._widget_enabled and self.available:
-            try:
-                self.plotter.clear_plane_widgets()
-            except Exception:
-                pass
-            self._widget_enabled = False
-        if hasattr(self, "drag_box"):
-            self.drag_box.blockSignals(True)
-            self.drag_box.setChecked(False)
-            self.drag_box.blockSignals(False)
-
-    # --------------------------------------------------------------- display
+        try:
+            self.plotter.add_scalar_bar(
+                title="Amplitude",
+                mapper=self.planes[0].actor.mapper,
+                color="#e6e9ee",
+                title_font_size=13,
+                label_font_size=10,
+                width=0.06,
+                height=0.35,
+                position_x=0.90,
+                position_y=0.06,
+                vertical=True,
+            )
+        except Exception:
+            pass
 
     def _apply_settings(self) -> None:
-        if not self.available or self.volume is None:
+        if not self.available or not self.planes:
             return
-        cmap = vtk_colormap_name(self.settings.cmap)
-        clim = self.settings.levels
-        for row, plane in enumerate(self.planes):
+        cmap = vtk_colormap_name(self.settings.cmap, self.settings.reverse)
+        lo, hi = self.settings.levels
+        for plane in self.planes:
             try:
-                self.plotter.update_scalars(
-                    plane.mesh.point_data["amplitude"],
-                    mesh=plane.mesh,
-                    render=False,
-                )
-                mapper = plane.actor.GetMapper()
-                mapper.SetScalarRange(clim[0], clim[1])
-                lut = mapper.GetLookupTable()
-                if lut is not None:
-                    lut.SetRange(clim[0], clim[1])
+                plane.actor.mapper.lookup_table.cmap = cmap
+                plane.actor.mapper.scalar_range = (lo, hi)
             except Exception:
                 pass
         self.plotter.render()
 
-    # --------------------------------------------------------------- camera
+    # ----------------------------------------------------------------- camera
 
-    def set_camera_preset(self, name: str) -> None:
+    def set_camera_preset(self, preset: str) -> None:
+        """Point the camera at the cube, always with time going down."""
         if not self.available or self.volume is None:
             return
-        vol = self.volume
+
         sx, sy, sz = self._spacing
-        cx = vol.n_iline * sx / 2
-        cy = vol.n_xline * sy / 2
-        cz = vol.n_time * sz / 2
-        dist = max(vol.n_iline * sx, vol.n_xline * sy, vol.n_time * sz) * 2.5
+        n_il, n_xl, n_t = self.volume.shape
+        cx, cy, cz = (n_il - 1) * sx / 2, (n_xl - 1) * sy / 2, (n_t - 1) * sz / 2
+        span = max((n_il - 1) * sx, (n_xl - 1) * sy, (n_t - 1) * sz) or 1.0
 
-        if name == "Inline":
-            self.plotter.camera_position = [
-                (cx - dist, cy, cz), (cx, cy, cz), (0, 0, -1)
-            ]
-        elif name == "Crossline":
-            self.plotter.camera_position = [
-                (cx, cy - dist, cz), (cx, cy, cz), (0, 0, -1)
-            ]
-        elif name == "Map (time)":
-            self.plotter.camera_position = [
-                (cx, cy, cz - dist), (cx, cy, cz), (0, -1, 0)
-            ]
-        else:  # Isometric
-            self.plotter.camera_position = [
-                (cx + dist * 0.6, cy - dist * 0.6, cz - dist * 0.5),
-                (cx, cy, cz),
-                (0, 0, -1),
-            ]
+        if preset == "Inline":
+            position = (cx - 2.4 * span, cy, cz)
+            up = (0.0, 0.0, -1.0)
+        elif preset == "Crossline":
+            position = (cx, cy - 2.4 * span, cz)
+            up = (0.0, 0.0, -1.0)
+        elif preset.startswith("Map"):
+            position = (cx, cy, cz - 2.4 * span)
+            up = (0.0, 1.0, 0.0)
+        else:
+            position = (cx - 1.7 * span, cy - 2.0 * span, cz - 1.5 * span)
+            up = (0.0, 0.0, -1.0)
+
+        self.plotter.camera_position = [position, (cx, cy, cz), up]
+        self.plotter.reset_camera()
         self.plotter.render()
-
-    # --------------------------------------------------------------- export
 
     def screenshot(self, path: str) -> None:
         if self.available:
             self.plotter.screenshot(path)
 
-    # --------------------------------------------------------------- cleanup
-
-    def _clear_scene(self) -> None:
-        if not self.available:
-            return
-        self._remove_plane_widget()
-        self.planes.clear()
-        self.slice_list.clear()
-        self.plotter.clear()
-        self._outline_actor = None
-
     def close_view(self) -> None:
+        """Release the VTK render window; call before the app exits."""
         if self.available:
             try:
                 self.plotter.close()

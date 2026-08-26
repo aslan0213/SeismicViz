@@ -1,104 +1,109 @@
-"""Shared display configuration: colormaps, amplitude windows, sync."""
+"""Shared colour / amplitude settings for every 2D and 3D view.
+
+A single :class:`DisplaySettings` instance is handed to all the views that
+should stay visually consistent, so changing a colormap or a clip level in one
+place updates the whole window - and the side-by-side comparison keeps both
+panels on identical scales, which is the only way a difference is meaningful.
+"""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
-import matplotlib
-import matplotlib.cm as cm
-import matplotlib.colors as mcolors
 import numpy as np
 import pyqtgraph as pg
+from matplotlib import colormaps as mpl_colormaps
+from matplotlib.colors import LinearSegmentedColormap
 from PyQt6.QtCore import QObject, pyqtSignal
 
-if TYPE_CHECKING:
-    from PyQt6.QtWidgets import QWidget
+# Colormaps offered in the UI. The first two are the conventional choices for
+# post-stack amplitude displays; the rest are useful for attribute-style looks.
+COLORMAPS: list[str] = [
+    "seismic",
+    "gray",
+    "RdBu_r",
+    "bwr",
+    "PuOr",
+    "viridis",
+    "magma",
+    "petrel",
+]
 
-COLORMAPS = ["seismic", "petrel", "gray", "bwr", "coolwarm", "viridis", "inferno"]
+# "petrel": the blue-white-red ramp used by most interpretation packages, with
+# a slightly compressed white band so weak amplitudes stay visible.
+_PETREL = LinearSegmentedColormap.from_list(
+    "petrel",
+    [
+        (0.00, "#00204a"),
+        (0.25, "#1f6fd0"),
+        (0.46, "#eef3fa"),
+        (0.50, "#ffffff"),
+        (0.54, "#faeeee"),
+        (0.75, "#d3341f"),
+        (1.00, "#4a0a00"),
+    ],
+)
 
-_PETREL_SEGMENTS = {
-    "red": [(0.0, 0.0, 0.0), (0.35, 0.15, 0.15), (0.5, 1.0, 1.0), (0.65, 0.95, 0.95), (1.0, 0.8, 0.8)],
-    "green": [(0.0, 0.2, 0.2), (0.35, 0.8, 0.8), (0.5, 1.0, 1.0), (0.65, 0.75, 0.75), (1.0, 0.1, 0.1)],
-    "blue": [(0.0, 0.7, 0.7), (0.35, 0.95, 0.95), (0.5, 1.0, 1.0), (0.65, 0.15, 0.15), (1.0, 0.1, 0.1)],
-}
-
-try:
-    matplotlib.colormaps.register(
-        name="petrel",
-        cmap=mcolors.LinearSegmentedColormap("petrel", _PETREL_SEGMENTS, N=256),
-    )
-except ValueError:
-    pass  # Already registered if imported multiple times.
-
-# Cache built lookup tables so toggling between colormaps is instant.
 _LUT_CACHE: dict[tuple[str, bool], np.ndarray] = {}
 
 
-def lookup_table(name: str, reverse: bool = False, n: int = 512) -> np.ndarray:
-    """A 512-entry RGBA LUT for pyqtgraph's ImageItem."""
-    key = (name, reverse)
-    lut = _LUT_CACHE.get(key)
-    if lut is not None:
-        return lut
-
-    cmap_name = name + "_r" if reverse and not name.endswith("_r") else name
+def _matplotlib_cmap(name: str):
+    if name == "petrel":
+        return _PETREL
     try:
-        cmap = matplotlib.colormaps.get_cmap(cmap_name)
-    except ValueError:
-        cmap = matplotlib.colormaps.get_cmap("seismic")
+        return mpl_colormaps[name]
+    except KeyError:
+        return mpl_colormaps["seismic"]
 
-    indices = np.linspace(0.0, 1.0, n)
-    rgba = (cmap(indices) * 255.0).astype(np.uint8)
-    _LUT_CACHE[key] = rgba
-    return rgba
+
+def lookup_table(name: str, reverse: bool = False, size: int = 512) -> np.ndarray:
+    """RGBA lookup table for pyqtgraph's ImageItem."""
+    key = (name, reverse)
+    cached = _LUT_CACHE.get(key)
+    if cached is not None and cached.shape[0] == size:
+        return cached
+
+    cmap = _matplotlib_cmap(name)
+    positions = np.linspace(1.0, 0.0, size) if reverse else np.linspace(0.0, 1.0, size)
+    lut = (np.asarray(cmap(positions)) * 255.0).round().astype(np.ubyte)
+    _LUT_CACHE[key] = lut
+    return lut
 
 
 def color_map(name: str, reverse: bool = False) -> pg.ColorMap:
-    """Build a :class:`pg.ColorMap` backed by the matplotlib definition."""
-    lut = lookup_table(name, reverse=reverse, n=256)
-    pos = np.linspace(0.0, 1.0, len(lut))
-    return pg.ColorMap(pos, lut)
+    """pyqtgraph ColorMap, used by the interactive colour bars."""
+    lut = lookup_table(name, reverse, size=256)
+    return pg.ColorMap(np.linspace(0.0, 1.0, lut.shape[0]), lut)
 
 
-def vtk_colormap_name(name: str) -> str:
-    """Map a UI colormap name to a preset that PyVista/VTK understands."""
-    table = {
-        "seismic": "bwr",
-        "petrel": "coolwarm",
-        "gray": "gray",
-        "bwr": "bwr",
-        "coolwarm": "coolwarm",
-        "viridis": "viridis",
-        "inferno": "inferno",
-    }
-    return table.get(name, "bwr")
+def vtk_colormap_name(name: str, reverse: bool) -> str:
+    """Name PyVista understands. It accepts matplotlib names directly."""
+    base = "seismic" if name == "petrel" else name
+    return base + "_r" if reverse else base
 
 
 class DisplaySettings(QObject):
-    """Observable display parameters shared across all views."""
+    """Colormap and amplitude window shared by a group of views."""
 
-    #: Fired whenever any visual parameter changes.
     changed = pyqtSignal()
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self._cmap = "seismic"
-        self._reverse_cmap = False
-        self._vmin: float = -1.0
-        self._vmax: float = 1.0
-        self._percentile: float = 99.0
-        self._auto_levels: bool = True
-        self._muted: bool = False
+        self._reverse = False
+        self._vmin = -1.0
+        self._vmax = 1.0
+        self._percentile = 99.0
+        self._auto = True
+        self._muted = False
 
-    # -------------------------------------------------------------- properties
+    # ---------------------------------------------------------------- getters
 
     @property
     def cmap(self) -> str:
         return self._cmap
 
     @property
-    def reverse_cmap(self) -> bool:
-        return self._reverse_cmap
+    def reverse(self) -> bool:
+        return self._reverse
 
     @property
     def levels(self) -> tuple[float, float]:
@@ -110,72 +115,85 @@ class DisplaySettings(QObject):
 
     @property
     def auto_levels(self) -> bool:
-        return self._auto_levels
-
-    # --------------------------------------------------------------- mutators
-
-    def set_cmap(self, name: str, reverse: bool | None = None) -> None:
-        dirty = False
-        if name in COLORMAPS and name != self._cmap:
-            self._cmap = name
-            dirty = True
-        if reverse is not None and reverse != self._reverse_cmap:
-            self._reverse_cmap = reverse
-            dirty = True
-        if dirty:
-            self._notify()
-
-    def set_levels(self, vmin: float, vmax: float, from_user: bool = False) -> None:
-        if vmin >= vmax:
-            vmax = vmin + 1e-4
-        if (vmin, vmax) == (self._vmin, self._vmax):
-            return
-        self._vmin = float(vmin)
-        self._vmax = float(vmax)
-        if from_user:
-            self._auto_levels = False
-        self._notify()
-
-    def set_percentile(self, p: float) -> None:
-        p = float(np.clip(p, 50.0, 100.0))
-        if p != self._percentile:
-            self._percentile = p
-            self._notify()
-
-    def set_auto_levels(self, auto: bool) -> None:
-        if auto != self._auto_levels:
-            self._auto_levels = auto
-            self._notify()
-
-    def autoscale_to(self, data: np.ndarray | None) -> None:
-        """Update levels from data if auto_levels is enabled."""
-        if not self._auto_levels or data is None or data.size == 0:
-            return
-        finite = data[np.isfinite(data)]
-        if finite.size == 0:
-            return
-        lim = float(np.percentile(np.abs(finite), self._percentile))
-        if lim <= 0.0:
-            lim = float(np.abs(finite).max()) or 1.0
-        self.set_levels(-lim, lim)
+        return self._auto
 
     def lut(self) -> np.ndarray:
-        """The 512-entry RGBA LUT for current colormap settings."""
-        return lookup_table(self._cmap, self._reverse_cmap)
+        return lookup_table(self._cmap, self._reverse)
 
     def pg_colormap(self) -> pg.ColorMap:
-        return color_map(self._cmap, self._reverse_cmap)
+        return color_map(self._cmap, self._reverse)
 
-    def copy_from(self, other: DisplaySettings) -> None:
-        """Mirror another settings object without rebinding signals."""
-        self._cmap = other._cmap
-        self._reverse_cmap = other._reverse_cmap
-        self._vmin = other._vmin
-        self._vmax = other._vmax
-        self._percentile = other._percentile
-        self._auto_levels = other._auto_levels
-        self._notify()
+    # ---------------------------------------------------------------- setters
 
-    def _notify(self) -> None:
+    def set_cmap(self, name: str, reverse: bool | None = None) -> None:
+        changed = name != self._cmap
+        if reverse is not None and reverse != self._reverse:
+            self._reverse = reverse
+            changed = True
+        self._cmap = name
+        if changed:
+            self._emit()
+
+    def set_reverse(self, reverse: bool) -> None:
+        if reverse != self._reverse:
+            self._reverse = reverse
+            self._emit()
+
+    def set_levels(self, vmin: float, vmax: float, from_user: bool = True) -> None:
+        """Set the amplitude window. A user edit turns auto-scaling off."""
+        if vmax <= vmin:
+            vmax = vmin + 1e-6
+        if (vmin, vmax) == (self._vmin, self._vmax):
+            return
+        self._vmin, self._vmax = float(vmin), float(vmax)
+        if from_user:
+            self._auto = False
+        self._emit()
+
+    def set_percentile(self, value: float) -> None:
+        value = float(np.clip(value, 50.0, 100.0))
+        if value != self._percentile:
+            self._percentile = value
+            self._emit()
+
+    def set_auto_levels(self, auto: bool) -> None:
+        if auto != self._auto:
+            self._auto = auto
+            self._emit()
+
+    def autoscale_to(self, data: np.ndarray) -> None:
+        """Recompute a symmetric window from the data, if auto-scaling is on."""
+        if not self._auto:
+            return
+        finite = np.asarray(data, dtype=np.float32).ravel()
+        finite = finite[np.isfinite(finite)]
+        if finite.size == 0:
+            return
+        level = float(np.percentile(np.abs(finite), self._percentile))
+        if level <= 0.0:
+            level = float(np.abs(finite).max()) or 1.0
+        self.set_levels(-level, level, from_user=False)
+
+    def copy_from(self, other: "DisplaySettings") -> None:
+        """Adopt another group's look, e.g. to keep two panels comparable."""
+        self._muted = True
+        try:
+            self.set_cmap(other.cmap, other.reverse)
+            self.set_percentile(other.percentile)
+            self.set_auto_levels(other.auto_levels)
+            self.set_levels(*other.levels, from_user=False)
+        finally:
+            self._muted = False
+        self.changed.emit()
+
+    # ---------------------------------------------------------------- helpers
+
+    def mute(self, muted: bool) -> None:
+        """Suppress ``changed`` while several properties are being set."""
+        self._muted = muted
+        if not muted:
+            self.changed.emit()
+
+    def _emit(self) -> None:
         if not self._muted:
             self.changed.emit()

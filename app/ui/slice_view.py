@@ -1,3 +1,15 @@
+"""Interactive 2D seismic section viewer.
+
+Wraps pyqtgraph so the rest of the application deals in seismic terms - a
+section is ``(n_traces, n_samples)``, time runs downwards, and positions are
+reported in survey units rather than pixels.
+
+Provides the interaction the assignment asks for: wheel zoom, drag to pan, a
+draggable colour bar for the amplitude window, a crosshair whose position can
+be mirrored into another view, and a rectangular ROI used to pick the region
+sent to the spectrum module.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -99,6 +111,8 @@ class SliceView(QWidget):
 
         self.image = pg.ImageItem()
         self.image.setOpts(axisOrder="col-major")   # image[trace, sample]
+        # Average rather than drop samples when a section is larger than the
+        # widget; without this a zoomed-out display aliases badly.
         self.image.setAutoDownsample(True)
         self.plot.addItem(self.image)
 
@@ -360,7 +374,11 @@ class SliceView(QWidget):
         self.roi.setSize((nx * 0.5 * self.axes.dx, ny * 0.5 * self.axes.dy), finish=False)
 
     def roi_index_bounds(self) -> tuple[int, int, int, int] | None:
-        """ROI as ``(trace_start, trace_stop, sample_start, sample_stop)``."""
+        """ROI as ``(trace_start, trace_stop, sample_start, sample_stop)``.
+
+        Returns ``None`` when there is no section or the ROI is hidden, in
+        which case callers should fall back to the whole section.
+        """
         if self._section is None or not self.roi.isVisible():
             return None
 
