@@ -1,15 +1,22 @@
-"""Arbitrary-line section: draw a polyline on a map, see the composite section."""
+"""Arbitrary / composite line extraction (the assignment's optional item).
+
+A map view shows one time slice of the cube. The user drags a polyline across
+it; the traverse is resampled on the bin grid, bilinearly interpolated through
+the volume, and drawn as a composite section next to the map.
+"""
 
 from __future__ import annotations
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QSlider,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
@@ -20,181 +27,222 @@ from .slice_view import AxisMap, SliceView
 
 
 class ArbitraryLineView(QWidget):
-    """Map view with a draggable polyline and the resulting composite section."""
+    """Map + composite section for a user-drawn traverse."""
+
+    sectionChanged = pyqtSignal()
 
     def __init__(self, settings: DisplaySettings, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.settings = settings
         self.volume: SeismicVolume | None = None
-        self.section: np.ndarray | None = None
+        self._section: np.ndarray | None = None
         self._path: np.ndarray | None = None
+        self._updating = False
 
-        self._build_ui()
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.addLayout(self._build_toolbar())
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        # The map is a plan view, so it keeps the normal y direction.
+        self.map_view = SliceView(settings, "Map - time slice", invert_y=False)
+        self.section_view = SliceView(settings, "Composite section")
+        splitter.addWidget(self.map_view)
+        splitter.addWidget(self.section_view)
+        splitter.setSizes([520, 780])
+        layout.addWidget(splitter, 1)
+
+        self.info = QLabel("Load a volume to draw an arbitrary line.")
+        self.info.setStyleSheet("color:#9aa4b2;")
+        layout.addWidget(self.info)
+
+        self._make_line_roi()
 
     # ------------------------------------------------------------------ setup
 
-    def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(2, 2, 2, 2)
+    def _build_toolbar(self) -> QHBoxLayout:
+        bar = QHBoxLayout()
 
-        # -- toolbar ----------------------------------------------------------
-        toolbar = QHBoxLayout()
+        bar.addWidget(QLabel("Map time slice"))
+        self.time_slider = QSlider(Qt.Orientation.Horizontal)
+        self.time_slider.setMaximumWidth(260)
+        self.time_slider.valueChanged.connect(self._time_changed)
+        bar.addWidget(self.time_slider)
 
-        self.update_btn = QPushButton("Extract section")
-        self.update_btn.clicked.connect(self.update_section)
-        toolbar.addWidget(self.update_btn)
+        self.time_label = QLabel("-")
+        self.time_label.setMinimumWidth(80)
+        bar.addWidget(self.time_label)
+
+        reset = QPushButton("Reset line")
+        reset.clicked.connect(self.reset_line)
+        bar.addWidget(reset)
 
         self.live_box = QCheckBox("Live update")
-        self.live_box.setToolTip("Recompute the section whenever the line is dragged")
-        self.live_box.setChecked(False)
-        toolbar.addWidget(self.live_box)
-
-        self.status = QLabel("")
-        self.status.setStyleSheet("color: #999;")
-        toolbar.addWidget(self.status, 1)
-        layout.addLayout(toolbar)
-
-        # -- two panels -------------------------------------------------------
-        panels = QHBoxLayout()
-
-        # Left: map (time slice) — y axis NOT inverted for a plan view.
-        self.map_view = SliceView(self.settings, "Map view", show_toolbar=False, invert_y=False)
-        panels.addWidget(self.map_view, 1)
-
-        # Right: composite section along the polyline.
-        self.section_view = SliceView(self.settings, "Composite section", show_toolbar=True)
-        panels.addWidget(self.section_view, 1)
-        layout.addLayout(panels, 1)
-
-        # -- polyline ROI on the map -----------------------------------------
-        handles = [(0.3, 0.3), (0.5, 0.7), (0.7, 0.4)]
-        self.polyline = pg.PolyLineROI(
-            handles,
-            pen=pg.mkPen("#ffab00", width=2),
-            handlePen=pg.mkPen("#ffdd57", width=2),
-            closed=False,
+        self.live_box.setChecked(True)
+        self.live_box.setToolTip(
+            "Recompute while dragging. Turn off on very large cubes; the "
+            "section then updates when the mouse is released."
         )
-        self.polyline.setZValue(20)
-        self.map_view.plot.addItem(self.polyline)
-        self.polyline.sigRegionChanged.connect(self._line_moved)
+        bar.addWidget(self.live_box)
 
-    # ---------------------------------------------------------------- volume
+        extract = QPushButton("Extract now")
+        extract.clicked.connect(self.update_section)
+        bar.addWidget(extract)
+
+        bar.addStretch(1)
+        self.hint = QLabel(
+            "Drag the yellow handles to move the traverse; click a segment to add a bend."
+        )
+        self.hint.setStyleSheet("color:#9aa4b2;")
+        bar.addWidget(self.hint)
+        return bar
+
+    def _make_line_roi(self) -> None:
+        self.line_roi = pg.PolyLineROI(
+            [[0, 0], [1, 1]],
+            closed=False,
+            pen=pg.mkPen("#ffab00", width=2),
+            handlePen=pg.mkPen("#ffd54f", width=2),
+        )
+        self.line_roi.setZValue(30)
+        self.map_view.plot.addItem(self.line_roi)
+        self.line_roi.sigRegionChanged.connect(self._roi_moved)
+        self.line_roi.sigRegionChangeFinished.connect(lambda *_: self.update_section())
+
+    # ----------------------------------------------------------------- volume
 
     def set_volume(self, volume: SeismicVolume | None) -> None:
         self.volume = volume
-        self.section = None
-        self._path = None
         if volume is None:
             self.map_view.clear()
             self.section_view.clear()
+            self._section = None
+            self.info.setText("Load a volume to draw an arbitrary line.")
             return
 
-        # Show a time slice in the middle as the map background.
-        mid = volume.n_time // 2
-        time_section = volume.slice(AXIS_TIME, mid)
-        geo = volume.geometry
+        self._updating = True
+        try:
+            self.time_slider.setRange(0, volume.n_time - 1)
+            self.time_slider.setValue(volume.n_time // 3)
+        finally:
+            self._updating = False
+
+        self._draw_map()
+        self.reset_line()
+
+    def _time_changed(self, _value: int) -> None:
+        if self._updating or self.volume is None:
+            return
+        self._draw_map()
+
+    def _draw_map(self) -> None:
+        if self.volume is None:
+            return
+        index = self.time_slider.value()
+        section = self.volume.slice(AXIS_TIME, index)
         axes = AxisMap(
-            x0=geo.iline_label(0),
-            dx=geo.il_step,
-            y0=geo.xline_label(0),
-            dy=geo.xl_step,
+            x0=self.volume.geometry.iline_label(0),
+            dx=self.volume.geometry.il_step,
+            y0=self.volume.geometry.xline_label(0),
+            dy=self.volume.geometry.xl_step,
             x_label="Inline",
             y_label="Crossline",
         )
         self.map_view.set_section(
-            time_section, axes,
-            "Time slice  %s" % geo.axis_label(AXIS_TIME, mid),
+            section, axes, "Map - %s" % self.volume.geometry.axis_label(AXIS_TIME, index)
         )
+        self.time_label.setText(self.volume.geometry.axis_label(AXIS_TIME, index))
 
-        # Reset the polyline to span the survey.
-        n_il, n_xl = volume.n_iline, volume.n_xline
-        handles = [
-            (axes.to_x(n_il * 0.25), axes.to_y(n_xl * 0.25)),
-            (axes.to_x(n_il * 0.50), axes.to_y(n_xl * 0.75)),
-            (axes.to_x(n_il * 0.75), axes.to_y(n_xl * 0.50)),
+    # ------------------------------------------------------------------- line
+
+    def reset_line(self) -> None:
+        """Lay the traverse diagonally across the survey."""
+        if self.volume is None:
+            return
+        geometry = self.volume.geometry
+        n_il, n_xl = self.volume.n_iline, self.volume.n_xline
+
+        points = [
+            [geometry.iline_label(int(n_il * 0.10)), geometry.xline_label(int(n_xl * 0.15))],
+            [geometry.iline_label(int(n_il * 0.45)), geometry.xline_label(int(n_xl * 0.60))],
+            [geometry.iline_label(int(n_il * 0.88)), geometry.xline_label(int(n_xl * 0.35))],
         ]
-        self.polyline.blockSignals(True)
-        # Remove old handles and set new ones.
-        while len(self.polyline.getHandles()) > len(handles):
-            self.polyline.removeHandle(0)
-        for i, (x, y) in enumerate(handles):
-            if i < len(self.polyline.getHandles()):
-                self.polyline.getHandles()[i].setPos(x, y)
-            else:
-                self.polyline.addFreeHandle((x, y))
-        self.polyline.blockSignals(False)
-
-        self.section_view.clear()
-        self.status.setText("Click 'Extract section' to compute the composite line.")
-
-    # ------------------------------------------------------------ waypoints
+        self.line_roi.blockSignals(True)
+        try:
+            self.line_roi.setPoints(points, closed=False)
+        finally:
+            self.line_roi.blockSignals(False)
+        self.update_section()
 
     def waypoints(self) -> list[tuple[float, float]]:
-        """Polyline handle positions in array-index coordinates."""
-        pts: list[tuple[float, float]] = []
+        """Handle positions converted to array indices."""
+        state = self.line_roi.getState()
+        origin = self.line_roi.pos()
         axes = self.map_view.axes
-        for handle in self.polyline.getHandles():
-            pos = self.polyline.mapToParent(handle.pos())
-            il = axes.to_ix(pos.x())
-            xl = axes.to_iy(pos.y())
-            pts.append((il, xl))
-        return pts
 
-    # -------------------------------------------------------- extract section
+        points = []
+        for point in state["points"]:
+            x = origin.x() + point.x()
+            y = origin.y() + point.y()
+            points.append((axes.to_ix(x), axes.to_iy(y)))
+        return points
 
-    def update_section(self) -> None:
-        if self.volume is None:
-            self.status.setText("No volume loaded.")
-            return
-
-        wp = self.waypoints()
-        if len(wp) < 2:
-            self.status.setText("Need at least two waypoints.")
-            return
-
-        vol = self.volume
-        # Clamp waypoints inside the survey.
-        clamped = [
-            (float(np.clip(il, 0, vol.n_iline - 1)),
-             float(np.clip(xl, 0, vol.n_xline - 1)))
-            for il, xl in wp
-        ]
-
-        try:
-            section, path = vol.arbitrary_slice(clamped)
-        except ValueError as exc:
-            self.status.setText(str(exc))
-            return
-
-        self.section = section
-        self._path = path
-
-        geo = vol.geometry
-        axes = AxisMap(
-            x0=0,
-            dx=1,
-            y0=geo.time_label(0),
-            dy=geo.dt * 1000.0,
-            x_label="Trace along line",
-            y_label="Time (ms)",
-        )
-        self.section_view.set_section(
-            section, axes,
-            "Arbitrary line  (%d traces)" % section.shape[0],
-        )
-        self.status.setText(
-            "%d traces x %d samples from %d waypoints"
-            % (section.shape[0], section.shape[1], len(clamped))
-        )
-
-    def _line_moved(self) -> None:
+    def _roi_moved(self, *_args) -> None:
         if self.live_box.isChecked():
             self.update_section()
 
-    # ----------------------------------------------------------- ROI access
+    def update_section(self) -> None:
+        if self.volume is None:
+            return
+
+        points = self.waypoints()
+        if len(points) < 2:
+            return
+
+        # Clamp to the survey so a handle dragged outside cannot break extraction.
+        clamped = [
+            (
+                float(np.clip(il, 0, self.volume.n_iline - 1)),
+                float(np.clip(xl, 0, self.volume.n_xline - 1)),
+            )
+            for il, xl in points
+        ]
+
+        try:
+            section, path = self.volume.arbitrary_slice(clamped)
+        except ValueError as exc:
+            self.info.setText("Cannot extract: %s" % exc)
+            return
+
+        geometry = self.volume.geometry
+        axes = AxisMap(
+            x0=0.0,
+            dx=1.0,
+            y0=geometry.time_label(0),
+            dy=geometry.dt * 1000.0,
+            x_label="Distance along line (bins)",
+            y_label="Time (ms)",
+        )
+        self.section_view.set_section(
+            section, axes, "Composite section - %d traces" % section.shape[0]
+        )
+
+        self._section = section
+        self._path = path
+        length = float(np.hypot(*np.diff(path, axis=0).T).sum()) if len(path) > 1 else 0.0
+        self.info.setText(
+            "%d waypoints, %d traces, traverse length %.1f bins"
+            % (len(points), section.shape[0], length)
+        )
+        self.sectionChanged.emit()
+
+    # ------------------------------------------------------------------ access
+
+    @property
+    def section(self) -> np.ndarray | None:
+        return self._section
 
     def roi_section(self) -> np.ndarray | None:
-        """The composite section (or its ROI sub-region) for the spectrum."""
         return self.section_view.roi_section()
 
     def roi_description(self) -> str:
