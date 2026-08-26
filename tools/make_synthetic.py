@@ -1,185 +1,200 @@
-"""Generate a synthetic post-stack seismic volume for testing.
+"""Generate a synthetic post-stack seismic cube for testing.
 
-The cube is built from a structural model convolved with a Ricker wavelet and
-has enough variety (regional dip, anticline, normal fault, meandering channel,
-band-limited noise, acquisition footprint) to exercise every feature of the
-viewer.
+The assignment ships a real ``(il, xl, t)`` ``.npy`` volume; this script builds
+a stand-in with the same layout and the same visual character - dipping and
+folded reflectors, a normal fault, a channel, a bandlimited wavelet and noise -
+so the application can be exercised without the original data.
 
-Run::
-
-    python tools/make_synthetic.py
+    python tools/make_synthetic.py --out data/seismic_synthetic.npy
 """
 
 from __future__ import annotations
 
+import argparse
 import os
-import sys
-import time
 
 import numpy as np
-
-# ---------------------------------------------------------------------------
-#  Parameters
-# ---------------------------------------------------------------------------
-
-N_IL, N_XL, N_T = 180, 160, 320
-DT = 0.004                  # seconds  (4 ms)
-PEAK_FREQ = 28.0             # Hz      (Ricker wavelet)
-N_HORIZONS = 26
-NOISE_LEVEL = 0.12
-SEED = 42
-
-OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
-OUTPUT_FILE = os.path.join(OUTPUT_DIR, "seismic_synthetic.npy")
+from scipy import ndimage
 
 
-# ---------------------------------------------------------------------------
-#  Ricker wavelet
-# ---------------------------------------------------------------------------
-
-def ricker(freq: float, dt: float, length: float = 0.08) -> np.ndarray:
-    """Ricker (Mexican hat) wavelet centred at t = 0."""
-    t = np.arange(-length / 2, length / 2, dt)
+def ricker(freq: float, dt: float, length: float = 0.256) -> np.ndarray:
+    """Zero-phase Ricker wavelet, the usual stand-in for a post-stack pulse."""
+    n = int(length / dt)
+    if n % 2 == 0:
+        n += 1
+    t = (np.arange(n) - n // 2) * dt
     a = (np.pi * freq * t) ** 2
     return ((1.0 - 2.0 * a) * np.exp(-a)).astype(np.float32)
 
 
-# ---------------------------------------------------------------------------
-#  Structural model
-# ---------------------------------------------------------------------------
-
-def make_structure(rng: np.random.Generator) -> np.ndarray:
-    """Horizon depth map ``(n_il, n_xl)`` for the first (shallowest) horizon."""
-    il = np.arange(N_IL, dtype=np.float64)
-    xl = np.arange(N_XL, dtype=np.float64)
-    II, XX = np.meshgrid(il, xl, indexing="ij")
-
-    # Regional dip.
-    surface = 40.0 + 0.15 * II + 0.10 * XX
-
-    # Anticline dome.
-    cx, cy = N_IL * 0.45, N_XL * 0.55
-    r2 = ((II - cx) / (N_IL * 0.28)) ** 2 + ((XX - cy) / (N_XL * 0.28)) ** 2
-    surface -= 20.0 * np.exp(-r2 * 3.0)
-
-    # Random wobble for realism.
-    surface += rng.normal(0, 1.2, surface.shape)
-
-    return surface
+def smooth_noise(shape: tuple[int, int], sigma: float, rng: np.random.Generator) -> np.ndarray:
+    """Correlated random field, used to give horizons a natural wobble."""
+    field = rng.normal(size=shape)
+    field = ndimage.gaussian_filter(field, sigma=sigma, mode="wrap")
+    peak = np.abs(field).max()
+    return (field / peak) if peak > 0 else field
 
 
-def make_fault_throw(rng: np.random.Generator) -> np.ndarray:
-    """Normal fault that displaces the eastern half downwards."""
-    il = np.arange(N_IL, dtype=np.float64)
-    xl = np.arange(N_XL, dtype=np.float64)
-    II, XX = np.meshgrid(il, xl, indexing="ij")
+def build_structure(n_il: int, n_xl: int, rng: np.random.Generator) -> np.ndarray:
+    """Vertical shift (in samples) applied to every horizon.
 
-    fault_xl = N_XL * 0.62 + 0.12 * (II - N_IL * 0.5)
-    throw = 14.0 / (1.0 + np.exp(-(XX - fault_xl) * 0.6))
-    return throw.astype(np.float64)
+    Combines a regional dip, a broad anticline and a fault so the cube has
+    something worth panning a slice through.
+    """
+    il = np.arange(n_il)[:, None].astype(np.float64)
+    xl = np.arange(n_xl)[None, :].astype(np.float64)
 
+    dip = 0.06 * il + 0.02 * xl
 
-# ---------------------------------------------------------------------------
-#  Channel
-# ---------------------------------------------------------------------------
+    # Anticline centred just off the middle of the survey.
+    ci, cx = n_il * 0.45, n_xl * 0.55
+    radius2 = ((il - ci) / (n_il * 0.30)) ** 2 + ((xl - cx) / (n_xl * 0.34)) ** 2
+    anticline = -26.0 * np.exp(-radius2)
 
-def make_channel(rng: np.random.Generator) -> np.ndarray:
-    """A meandering channel that will be visible on time slices."""
-    il = np.arange(N_IL, dtype=np.float64)
-    centre = N_XL * 0.35 + 12.0 * np.sin(2 * np.pi * il / (N_IL * 0.45))
-    centre += 6.0 * np.sin(2 * np.pi * il / (N_IL * 0.18) + 1.2)
+    # Normal fault: a smooth but rapid throw across an oblique plane.
+    plane = il * 0.75 + xl - n_xl * 0.62
+    fault = 11.0 * np.tanh(plane / 3.0)
 
-    xl = np.arange(N_XL, dtype=np.float64)
-    II, XX = np.meshgrid(il, xl, indexing="ij")
-    dist = np.abs(XX - centre[:, None])
-    width = 4.5
-    channel = np.exp(-(dist / width) ** 2)
-    return channel.astype(np.float64)
+    wobble = 5.0 * smooth_noise((n_il, n_xl), min(n_il, n_xl) * 0.10, rng)
+
+    return dip + anticline + fault + wobble
 
 
-# ---------------------------------------------------------------------------
-#  Build the cube
-# ---------------------------------------------------------------------------
+def build_reflectivity(
+    n_il: int, n_xl: int, n_t: int, rng: np.random.Generator
+) -> np.ndarray:
+    """Layer-cake reflectivity warped by the structural model."""
+    structure = build_structure(n_il, n_xl, rng)
+    refl = np.zeros((n_il, n_xl, n_t), dtype=np.float32)
 
-def build_cube() -> np.ndarray:
-    rng = np.random.default_rng(SEED)
+    # Horizon depths in samples, with a mix of strong and weak contrasts.
+    base_depths = np.sort(rng.uniform(0.06, 0.94, size=26) * n_t)
+    strengths = rng.normal(0.0, 0.35, size=base_depths.size)
+    strengths[np.abs(strengths) < 0.08] = 0.12          # avoid invisible layers
+    strengths[::7] *= 2.4                                # a few marker horizons
 
-    print("Building structural model...")
-    top_surface = make_structure(rng)
-    fault = make_fault_throw(rng)
-    channel = make_channel(rng)
+    il_idx, xl_idx = np.meshgrid(np.arange(n_il), np.arange(n_xl), indexing="ij")
 
-    reflectivity = np.zeros((N_IL, N_XL, N_T), dtype=np.float32)
+    for depth, strength in zip(base_depths, strengths):
+        # Deeper horizons follow the structure more closely than shallow ones.
+        follow = np.clip(depth / n_t * 1.6, 0.15, 1.0)
+        surface = depth + structure * follow
+        surface += 1.5 * smooth_noise((n_il, n_xl), n_il * 0.05, rng)
 
-    # Place horizons.
-    spacing = (N_T - 80) / N_HORIZONS
-    strengths = rng.uniform(0.3, 1.0, N_HORIZONS).astype(np.float32)
-    # Make a few horizons brighter (marker beds).
-    for idx in (3, 9, 17, 22):
-        if idx < N_HORIZONS:
-            strengths[idx] *= 2.4
+        amp = strength * (1.0 + 0.25 * smooth_noise((n_il, n_xl), n_il * 0.12, rng))
+        _stamp_horizon(refl, il_idx, xl_idx, surface, amp)
 
-    print("Placing %d horizons..." % N_HORIZONS)
-    for h in range(N_HORIZONS):
-        depth = top_surface + h * spacing + fault * (0.3 + 0.7 * h / N_HORIZONS)
-        depth = np.clip(depth, 0, N_T - 1)
-        # Smooth polarity reversal near the channel.
-        polarity = 1.0 - 0.8 * channel if h in (7, 8, 9) else np.ones_like(channel)
-        for i in range(N_IL):
-            for j in range(N_XL):
-                t_idx = int(round(depth[i, j]))
-                if 0 <= t_idx < N_T:
-                    reflectivity[i, j, t_idx] += strengths[h] * polarity[i, j]
-
-    # Channel amplitude anomaly.
-    channel_horizon = int(8 * spacing + 40)
-    if channel_horizon < N_T:
-        reflectivity[:, :, channel_horizon] += 0.6 * channel.astype(np.float32)
-
-    # Convolve with wavelet.
-    print("Convolving with Ricker wavelet (%.0f Hz)..." % PEAK_FREQ)
-    w = ricker(PEAK_FREQ, DT)
-    cube = np.zeros_like(reflectivity)
-    for i in range(N_IL):
-        for j in range(N_XL):
-            cube[i, j, :] = np.convolve(reflectivity[i, j, :], w, mode="same")
-
-    # Amplitude decay with depth.
-    decay = np.exp(-np.arange(N_T, dtype=np.float32) * DT / 0.8)
-    cube *= decay[None, None, :]
-
-    # Band-limited noise.
-    print("Adding noise (level %.0f%%)..." % (NOISE_LEVEL * 100))
-    noise = rng.normal(0, 1, cube.shape).astype(np.float32)
-    from scipy.ndimage import gaussian_filter1d
-    noise = gaussian_filter1d(noise, sigma=1.5, axis=2)
-    noise *= NOISE_LEVEL * cube.std() / max(noise.std(), 1e-9)
-    cube += noise
-
-    # Weak acquisition footprint (every 6th crossline slightly louder).
-    footprint = np.ones(N_XL, dtype=np.float32)
-    footprint[::6] = 1.04
-    cube *= footprint[None, :, None]
-
-    return cube
+    _add_channel(refl, structure, rng)
+    return refl
 
 
-# ---------------------------------------------------------------------------
-#  Main
-# ---------------------------------------------------------------------------
+def _stamp_horizon(
+    refl: np.ndarray,
+    il_idx: np.ndarray,
+    xl_idx: np.ndarray,
+    surface: np.ndarray,
+    amplitude: np.ndarray,
+) -> None:
+    """Write a reflection coefficient at a fractional depth.
+
+    Rounding each horizon to the nearest sample would leave visible staircase
+    steps wherever the surface crosses a sample boundary, so the coefficient is
+    split linearly between the two samples that straddle it.
+    """
+    n_t = refl.shape[2]
+    lower = np.floor(surface).astype(np.int64)
+    frac = (surface - lower).astype(np.float32)
+
+    for offset, weight in ((0, 1.0 - frac), (1, frac)):
+        sample = lower + offset
+        valid = (sample >= 0) & (sample < n_t)
+        if not valid.any():
+            continue
+        refl[il_idx[valid], xl_idx[valid], sample[valid]] += (
+            amplitude[valid] * weight[valid]
+        ).astype(np.float32)
+
+
+def _add_channel(refl: np.ndarray, structure: np.ndarray, rng: np.random.Generator) -> None:
+    """Carve a meandering channel into one horizon - a recognisable time-slice feature."""
+    n_il, n_xl, n_t = refl.shape
+    depth = 0.42 * n_t
+
+    il = np.arange(n_il)
+    centre = n_xl * 0.5 + n_xl * 0.18 * np.sin(2 * np.pi * il / (n_il * 0.8))
+    centre += n_xl * 0.06 * np.sin(2 * np.pi * il / (n_il * 0.23))
+    half_width = n_xl * 0.035
+
+    for i in range(n_il):
+        lo = int(max(0, centre[i] - half_width))
+        hi = int(min(n_xl, centre[i] + half_width))
+        if hi <= lo:
+            continue
+        position = depth + structure[i, lo:hi].mean() * 0.7
+        lower = int(np.floor(position))
+        frac = float(position - lower)
+        amp = -0.9 + rng.normal(0, 0.05, hi - lo).astype(np.float32)
+        for offset, weight in ((0, 1.0 - frac), (1, frac)):
+            if 0 <= lower + offset < n_t:
+                refl[i, lo:hi, lower + offset] += (amp * weight).astype(np.float32)
+
+
+def make_volume(
+    n_il: int, n_xl: int, n_t: int, dt: float, freq: float, noise: float, seed: int
+) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+
+    refl = build_reflectivity(n_il, n_xl, n_t, rng)
+    wavelet = ricker(freq, dt)
+
+    # Convolve every trace with the wavelet, keeping the original length.
+    seismic = ndimage.convolve1d(refl, wavelet, axis=2, mode="constant", cval=0.0, origin=0)
+    del refl
+
+    # Bandlimited random noise plus a faint acquisition footprint.
+    if noise > 0:
+        grain = rng.normal(0, 1, seismic.shape).astype(np.float32)
+        grain = ndimage.gaussian_filter1d(grain, sigma=1.2, axis=2, mode="nearest")
+        seismic += (noise * grain.std(ddof=0) ** -1 * seismic.std() * grain).astype(np.float32)
+
+        footprint = 0.03 * seismic.std() * np.cos(np.arange(n_xl) * np.pi / 3.0)
+        seismic += footprint.astype(np.float32)[None, :, None]
+
+    # Gentle amplitude decay with time, as in a real processed cube.
+    gain = np.exp(-np.arange(n_t) / (n_t * 1.9)).astype(np.float32)
+    seismic *= gain[None, None, :]
+
+    peak = float(np.percentile(np.abs(seismic), 99.5))
+    if peak > 0:
+        seismic /= peak
+    return seismic.astype(np.float32)
+
 
 def main() -> None:
-    t0 = time.time()
-    cube = build_cube()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out", default="data/seismic_synthetic.npy")
+    parser.add_argument("--iline", type=int, default=180, help="number of inlines")
+    parser.add_argument("--xline", type=int, default=160, help="number of crosslines")
+    parser.add_argument("--samples", type=int, default=320, help="samples per trace")
+    parser.add_argument("--dt", type=float, default=0.004, help="sample interval, seconds")
+    parser.add_argument("--freq", type=float, default=26.0, help="Ricker peak frequency, Hz")
+    parser.add_argument("--noise", type=float, default=0.12, help="noise level, 0-1")
+    parser.add_argument("--seed", type=int, default=2024)
+    args = parser.parse_args()
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    np.save(OUTPUT_FILE, cube)
-    size_mb = os.path.getsize(OUTPUT_FILE) / (1024 * 1024)
-
-    print(
-        "\nSaved %s\n  shape : %s\n  dtype : %s\n  size  : %.1f MB\n  time  : %.1f s"
-        % (OUTPUT_FILE, cube.shape, cube.dtype, size_mb, time.time() - t0)
+    volume = make_volume(
+        args.iline, args.xline, args.samples, args.dt, args.freq, args.noise, args.seed
     )
+
+    out = os.path.abspath(args.out)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    np.save(out, volume)
+
+    print("wrote %s" % out)
+    print("  shape   : %d IL x %d XL x %d samples" % volume.shape)
+    print("  dtype   : %s   size: %.1f MB" % (volume.dtype, volume.nbytes / 1024 / 1024))
+    print("  dt      : %.1f ms  (Nyquist %.0f Hz)" % (args.dt * 1000, 0.5 / args.dt))
+    print("  range   : %+.3f .. %+.3f" % (volume.min(), volume.max()))
 
 
 if __name__ == "__main__":

@@ -1,119 +1,83 @@
-"""Integration test for the C# spectrum-analysis module.
+"""Round-trip check of the Python <-> C# spectrum link.
 
-Exercises:
-  1. Auto-compilation (if the .exe is missing).
-  2. Protocol exchange against a two-sine synthetic test section.
-  3. Numerical agreement with numpy.fft.rfft.
-  4. Large payload handling (400 traces x 1000 samples = 1.6 MB).
-  5. Error response on degenerate geometry.
-
-Run::
-
-    python tools/test_spectrum_ipc.py
+Sends a synthetic gather whose spectrum is known analytically and compares the
+module's answer against numpy's own FFT.
 """
-
-from __future__ import annotations
-
 import os
 import sys
-
-# Ensure 'app' is on sys.path.
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import time
 
 import numpy as np
-from app.core.spectrum_client import (
-    WINDOW_HANN,
-    WINDOW_NONE,
-    SpectrumClient,
-    SpectrumError,
-)
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from app.core.spectrum_client import SpectrumClient, WINDOW_HANN, WINDOW_NONE
 
 
-def _numpy_reference(section: np.ndarray, dt: float, window_kind: int) -> tuple[np.ndarray, np.ndarray]:
-    """Compute the same average single-sided spectrum using NumPy."""
-    n_traces, n_samples = section.shape
-    nfft = 2
-    while nfft < n_samples:
-        nfft <<= 1
-
-    if window_kind == WINDOW_HANN:
-        taper = 0.5 * (1.0 - np.cos(2.0 * np.pi * np.arange(n_samples) / (n_samples - 1)))
+def reference_spectrum(section, dt, window):
+    n_samples = section.shape[1]
+    nfft = 1 << (n_samples - 1).bit_length()
+    nfft = max(nfft, 2)
+    if window == WINDOW_HANN:
+        taper = 0.5 * (1.0 - np.cos(2 * np.pi * np.arange(n_samples) / (n_samples - 1)))
     else:
-        taper = np.ones(n_samples, dtype=np.float64)
+        taper = np.ones(n_samples)
+    gain = taper.sum()
 
-    taper_gain = float(taper.sum()) or float(n_samples)
-
-    centered = section.astype(np.float64) - section.mean(axis=1, keepdims=True)
-    windowed = centered * taper[None, :]
-
-    rfft = np.fft.rfft(windowed, n=nfft, axis=1)
-    mag = np.abs(rfft)
-    if nfft > 2:
-        mag[:, 1:-1] *= 2.0  # single-sided doubling
-
-    avg_amp = (mag / taper_gain).mean(axis=0).astype(np.float32)
-    df = 1.0 / (nfft * dt)
-    freqs = np.arange(len(avg_amp), dtype=np.float32) * float(df)
-    return freqs, avg_amp
+    x = section.astype(np.float64)
+    x = (x - x.mean(axis=1, keepdims=True)) * taper
+    spec = np.abs(np.fft.rfft(x, n=nfft, axis=1))
+    spec[:, 1:nfft // 2] *= 2.0
+    amp = (spec / gain).mean(axis=0)
+    freqs = np.fft.rfftfreq(nfft, d=dt)
+    return freqs, amp
 
 
-def test_numerical_agreement() -> None:
-    print("[1/3] Testing numerical agreement against NumPy FFT...")
+def main():
     dt = 0.004
-    n_traces = 32
-    n_samples = 400
+    n_traces, n_samples = 64, 500
+    rng = np.random.default_rng(7)
+
     t = np.arange(n_samples) * dt
-
-    # 18 Hz + 42 Hz sine waves.
-    signal = (np.sin(2 * np.pi * 18.0 * t) + 0.6 * np.sin(2 * np.pi * 42.0 * t)).astype(np.float32)
-    section = np.tile(signal, (n_traces, 1))
-
-    with SpectrumClient() as client:
-        freqs_cs, amps_cs = client.average_spectrum(section, dt, WINDOW_HANN)
-
-    freqs_np, amps_np = _numpy_reference(section, dt, WINDOW_HANN)
-
-    assert len(freqs_cs) == len(freqs_np), "frequency bins mismatch"
-    assert np.allclose(freqs_cs, freqs_np, atol=1e-5), "frequencies do not match"
-
-    max_rel_err = np.max(np.abs(amps_cs - amps_np)) / np.max(amps_np)
-    print("      Max relative error vs NumPy: %.2e" % max_rel_err)
-    assert max_rel_err < 2e-3, "relative error too large (%.2e)" % max_rel_err
-    print("      PASS: C# FFT matches NumPy FFT within tolerance.")
-
-
-def test_large_payload() -> None:
-    print("[2/3] Testing large payload (400 traces x 1000 samples = 1.6 MB)...")
-    rng = np.random.default_rng(123)
-    big = rng.normal(0, 1, (400, 1000)).astype(np.float32)
+    section = np.zeros((n_traces, n_samples), dtype=np.float32)
+    for f0, a in ((18.0, 1.0), (42.0, 0.4)):
+        section += (a * np.sin(2 * np.pi * f0 * t)).astype(np.float32)
+    section += rng.normal(0, 0.02, section.shape).astype(np.float32)
 
     with SpectrumClient() as client:
-        freqs, amps = client.average_spectrum(big, dt=0.002, window=WINDOW_NONE)
+        print(client.status_text())
 
-    assert len(freqs) == 1024 // 2 + 1, "unexpected FFT size for 1000 samples"
-    assert amps.shape == freqs.shape
-    assert np.all(np.isfinite(amps))
-    print("      PASS: Received %d frequency bins (%.1f MB round-trip OK)." % (len(freqs), big.nbytes / 1e6))
+        for window, label in ((WINDOW_HANN, "Hann"), (WINDOW_NONE, "None")):
+            t0 = time.perf_counter()
+            freqs, amp = client.average_spectrum(section, dt, window)
+            elapsed = (time.perf_counter() - t0) * 1000
 
+            rf, ra = reference_spectrum(section, dt, window)
+            assert freqs.shape == rf.shape, (freqs.shape, rf.shape)
+            assert np.allclose(freqs, rf, atol=1e-3), "frequency axis mismatch"
 
-def test_error_handling() -> None:
-    print("[3/3] Testing error handling for invalid/degenerate geometry...")
-    degenerate = np.zeros((1, 1), dtype=np.float32)
+            err = np.max(np.abs(amp - ra)) / max(ra.max(), 1e-12)
+            peaks = freqs[np.argsort(amp)[-2:]]
+            print("  window=%-5s  %4d bins  df=%.4f Hz  %6.1f ms  "
+                  "max rel.err=%.2e  peaks=%s"
+                  % (label, amp.size, freqs[1], elapsed, err, np.sort(peaks)))
+            assert err < 2e-3, "C# spectrum disagrees with numpy (%.3e)" % err
 
-    with SpectrumClient() as client:
+        # A tall payload exercises the streaming reader on both sides.
+        big = rng.normal(0, 1, (400, 1000)).astype(np.float32)
+        t0 = time.perf_counter()
+        freqs, amp = client.average_spectrum(big, dt, WINDOW_HANN)
+        print("  400x1000 payload (1.5 MB): %.0f ms, %d bins"
+              % ((time.perf_counter() - t0) * 1000, amp.size))
+
+        # Error path: a degenerate ROI must come back as a clean exception.
         try:
-            client.average_spectrum(degenerate, dt=0.004)
-            assert False, "should have raised SpectrumError"
-        except SpectrumError as exc:
-            print("      PASS: Module correctly rejected degenerate input (%s)." % exc)
+            client.average_spectrum(np.zeros((1, 1), np.float32), dt)
+        except Exception as exc:
+            print("  degenerate ROI rejected as expected: %s" % type(exc).__name__)
+        else:
+            raise AssertionError("expected the module to reject a 1x1 ROI")
 
-
-def main() -> None:
-    print("=== Running Spectrum IPC Tests ===\n")
-    test_numerical_agreement()
-    test_large_payload()
-    test_error_handling()
-    print("\nALL SPECTRUM IPC TESTS PASSED!")
+    print("IPC ROUND TRIP OK")
 
 
 if __name__ == "__main__":

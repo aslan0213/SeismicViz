@@ -228,8 +228,6 @@ def slide_title_page(prs):
           size=12, colour=GREEN, space_after=0)
 
     shot = os.path.join(SHOTS, "03b_3d_vtk.png")
-    if not os.path.isfile(shot):
-        shot = os.path.join(SHOTS, "03_3d_isometric.png")
     if os.path.isfile(shot):
         place_image(slide, shot, 7.75, 1.35, 5.1, 4.9)
 
@@ -342,10 +340,7 @@ def slide_navigation(prs):
     slide = blank_slide(prs)
     slide_title(slide, "Navigating the cube",
                 "Direction and index drive every view at once")
-    shot = os.path.join(SHOTS, "02_2d_crossline.png")
-    if not os.path.isfile(shot):
-        shot = os.path.join(SHOTS, "02_2d_timeslice.png")
-    place_image(slide, shot, MARGIN, 1.45, 8.1, 5.2)
+    place_image(slide, os.path.join(SHOTS, "02_2d_crossline.png"), MARGIN, 1.45, 8.1, 5.2)
     bullet_panel(slide, 8.95, 1.45, SW - MARGIN - 8.95, 5.2, "Slice navigation", [
         "Direction: Inline, Crossline or Time",
         "Slider, spin box, or < and > to step one line at a time",
@@ -362,10 +357,7 @@ def slide_3d(prs):
     slide = blank_slide(prs)
     slide_title(slide, "3D visualization",
                 "Requirement 3 — interactive scene with movable slice planes")
-    shot = os.path.join(SHOTS, "03b_3d_vtk.png")
-    if not os.path.isfile(shot):
-        shot = os.path.join(SHOTS, "03_3d_isometric.png")
-    place_image(slide, shot, MARGIN, 1.42, 7.1, 5.25)
+    place_image(slide, os.path.join(SHOTS, "03b_3d_vtk.png"), MARGIN, 1.42, 7.1, 5.25)
     bullet_panel(slide, 7.95, 1.42, SW - MARGIN - 7.95, 5.25, "In the scene", [
         "Opens with one inline, one crossline and one time slice through the middle",
         "+ IL / + XL / + Time add more; each can be hidden or removed",
@@ -381,10 +373,8 @@ def slide_3d_moving(prs):
     slide = blank_slide(prs)
     slide_title(slide, "Adding and moving slices in 3D",
                 "The plane follows the slider immediately, even on a 9-million-sample cube")
-    shot = os.path.join(SHOTS, "03c_3d_inline_view.png")
-    if not os.path.isfile(shot):
-        shot = os.path.join(SHOTS, "03_3d_isometric.png")
-    place_image(slide, shot, MARGIN, 1.42, 7.1, 5.25)
+    place_image(slide, os.path.join(SHOTS, "03c_3d_inline_view.png"),
+                MARGIN, 1.42, 7.1, 5.25)
     bullet_panel(slide, 7.95, 1.42, SW - MARGIN - 7.95, 5.25, "Why it stays responsive",
                  [
         "A naive implementation cuts the full cube with a VTK cutter on every move",
@@ -435,10 +425,8 @@ def slide_smoothing(prs):
     slide = blank_slide(prs)
     slide_title(slide, "Gaussian smoothing",
                 "Requirement 5 — preview on a slice, or apply to the whole cube")
-    shot = os.path.join(SHOTS, "04_compare_smoothed.png")
-    if not os.path.isfile(shot):
-        shot = os.path.join(SHOTS, "04_compare_smooth.png")
-    place_image(slide, shot, MARGIN, 1.45, 8.1, 5.2)
+    place_image(slide, os.path.join(SHOTS, "04_compare_smoothed.png"),
+                MARGIN, 1.45, 8.1, 5.2)
     bullet_panel(slide, 8.95, 1.45, SW - MARGIN - 8.95, 5.2, "Gaussian blur", [
         "Independent sigmas across traces and along time — seismic sections are "
         "anisotropic and rarely deserve the same smoothing in both directions",
@@ -455,10 +443,8 @@ def slide_sharpening(prs):
     slide = blank_slide(prs)
     slide_title(slide, "Image sharpening",
                 "Requirement 5 — unsharp mask or Laplacian, on the same footing")
-    shot = os.path.join(SHOTS, "05_compare_sharpened.png")
-    if not os.path.isfile(shot):
-        shot = os.path.join(SHOTS, "04_compare_smooth.png")
-    place_image(slide, shot, MARGIN, 1.45, 8.1, 5.2)
+    place_image(slide, os.path.join(SHOTS, "05_compare_sharpened.png"),
+                MARGIN, 1.45, 8.1, 5.2)
     bullet_panel(slide, 8.95, 1.45, SW - MARGIN - 8.95, 5.2, "Sharpening", [
         "unsharp: subtract a blurred copy, add the residual back scaled by Amount",
         "laplacian: add back a discrete second derivative instead",
@@ -475,10 +461,8 @@ def slide_sync(prs):
     slide_title(slide, "Slice synchronisation",
                 "Requirement 6 — two volumes, one interaction")
 
-    shot = os.path.join(SHOTS, "08_compare_volumes.png")
-    if not os.path.isfile(shot):
-        shot = os.path.join(SHOTS, "04_compare_smooth.png")
-    place_image(slide, shot, MARGIN, 1.45, 8.1, 5.2)
+    place_image(slide, os.path.join(SHOTS, "08_compare_volumes.png"),
+                MARGIN, 1.45, 8.1, 5.2)
     bullet_panel(slide, 8.95, 1.45, SW - MARGIN - 8.95, 5.2, "What is synchronised", [
         "The slice index — both panels always show the same inline or crossline",
         "Zoom and pan — the view boxes are linked, so zooming one zooms the other",
@@ -541,10 +525,7 @@ def slide_spectrum_results(prs):
     slide = blank_slide(prs)
     slide_title(slide, "Spectrum and region of interest",
                 "The ROI rectangle selects exactly what is sent to the C# module")
-    shot = os.path.join(SHOTS, "06_spectrum.png")
-    if not os.path.isfile(shot):
-        shot = os.path.join(SHOTS, "06_spectrum_analysis.png")
-    place_image(slide, shot, MARGIN, 1.45, 8.1, 5.2)
+    place_image(slide, os.path.join(SHOTS, "06_spectrum.png"), MARGIN, 1.45, 8.1, 5.2)
     bullet_panel(slide, 8.95, 1.45, SW - MARGIN - 8.95, 5.2, "Using it", [
         "Tick ROI, then drag the yellow rectangle or its corner handles",
         "On the Compare tab the ROI is mirrored, so both panels are measured over "
@@ -600,10 +581,8 @@ def slide_arbitrary(prs):
     slide = blank_slide(prs)
     slide_title(slide, "Arbitrary line  (optional requirement)",
                 "A composite section along a traverse drawn on a map view")
-    shot = os.path.join(SHOTS, "07_arbitrary_line.png")
-    if not os.path.isfile(shot):
-        shot = os.path.join(SHOTS, "05_arbitrary_line.png")
-    place_image(slide, shot, MARGIN, 1.45, 8.1, 5.2)
+    place_image(slide, os.path.join(SHOTS, "07_arbitrary_line.png"),
+                MARGIN, 1.45, 8.1, 5.2)
     bullet_panel(slide, 8.95, 1.45, SW - MARGIN - 8.95, 5.2, "Extraction", [
         "The map is a time slice; pick a level where the geology is clear",
         "Drag a handle to move a bend, click a segment to add one",
@@ -818,7 +797,7 @@ def main() -> None:
     missing = [
         name
         for name in ("01_2d_inline.png", "03b_3d_vtk.png", "06_spectrum.png")
-        if not os.path.isfile(os.path.join(SHOTS, name)) and not os.path.isfile(os.path.join(SHOTS, "06_spectrum_analysis.png"))
+        if not os.path.isfile(os.path.join(SHOTS, name))
     ]
     if missing:
         raise SystemExit(
